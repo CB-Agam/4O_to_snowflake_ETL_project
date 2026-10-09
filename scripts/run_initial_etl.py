@@ -19,7 +19,7 @@ from etl.metadata import load_metadata_from_excel
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EXCEL_PATH = PROJECT_ROOT / "4D_to_Snowflake 1-50 tables mapping.xlsx"
+DEFAULT_EXCEL_PATH = PROJECT_ROOT / "4D_to_Snowflake (1-50 tables mapping).xlsx"
 
 
 def _normalize_target_table_name(value: str) -> str:
@@ -79,11 +79,16 @@ def run_for_table(excel_path: str, sheet_name: str, target_table: str | None = N
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create missing Snowflake tables from the Excel mapping and load data from 4D.")
     parser.add_argument("--excel", default=str(DEFAULT_EXCEL_PATH), help="Path to the Excel mapping workbook")
-    parser.add_argument("--sheet", default="Snowflake_table_names", help="Excel sheet name to read")
+    parser.add_argument(
+        "--sheet",
+        default=None,
+        help="Excel sheet name to read (defaults to --table, or Snowflake_table_names)",
+    )
     parser.add_argument("--table", default=None, help="Optional target table name to process. If omitted, process all tables.")
     args = parser.parse_args()
 
-    result = run_for_table(args.excel, args.sheet, args.table)
+    sheet_name = args.sheet or args.table or "Snowflake_table_names"
+    result = run_for_table(args.excel, sheet_name, args.table)
     for item in result["tables"]:
         print(f"Loaded {item['rows_loaded']} rows into {item['table']} from {item['source_table']}")
 

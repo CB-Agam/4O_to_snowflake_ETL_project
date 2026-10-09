@@ -41,7 +41,7 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
         "Snowflake Datatype",
         "datatype",
     )
-    constraint_name = _pick_column_name(columns, "constraint", "Constraint")
+    constraint_name = _pick_column_name(columns, "constraint", "constraints")
 
     if not all([source_table_name, source_column_name, target_table_name, target_column_name]):
         raise ValueError(
