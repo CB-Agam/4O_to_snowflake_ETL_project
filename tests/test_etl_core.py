@@ -1,13 +1,32 @@
 import unittest
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from etl.ddl import build_create_table_sql
 from etl.metadata import table_metadata_from_dataframe
 from config.settings import Settings
+from connections.fourd_connection import connect_to_4d
+from etl.load import build_source_query
 
 
 class EtlCoreTests(unittest.TestCase):
+    @patch("connections.fourd_connection.pyodbc.connect")
+    @patch("connections.fourd_connection.settings")
+    def test_connect_to_4d_does_not_execute_probe_query(self, settings, connect):
+        settings.missing_4d_settings.return_value = []
+        settings.fourd_connection_string.return_value = "DRIVER=test;"
+        settings.fourd_server = "server"
+        settings.fourd_port = "19813"
+        connection = Mock()
+        connect.return_value = connection
+
+        result = connect_to_4d()
+
+        self.assertIs(result, connection)
+        connect.assert_called_once_with("DRIVER=test;", timeout=30)
+        connection.cursor.assert_not_called()
+
     def test_4d_connection_string_does_not_require_database(self):
         settings = Settings()
         settings.fourd_server = "server"
@@ -48,6 +67,18 @@ class EtlCoreTests(unittest.TestCase):
         self.assertIn("ACC_CHEQUE_PAYMENTS", metadata)
         self.assertEqual(len(metadata["ACC_CHEQUE_PAYMENTS"]), 2)
         self.assertEqual(metadata["ACC_CHEQUE_PAYMENTS"][0]["target_column"], "CHEQUE_ID_NO")
+
+    def test_build_source_query_quotes_identifiers_and_skips_blank_columns(self):
+        query = build_source_query(
+            "Acc_Cheque_Payments",
+            ["Cheque_ID_No", "Cheque Date", "", "Name \"With\" Quotes"],
+        )
+
+        self.assertEqual(
+            query,
+            'SELECT "Cheque_ID_No", "Cheque Date", "Name ""With"" Quotes" '
+            'FROM "Acc_Cheque_Payments"',
+        )
 
     def test_build_create_table_sql_includes_primary_key(self):
         rows = [

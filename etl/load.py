@@ -13,10 +13,15 @@ def get_table_rows(metadata: Dict[str, List[Dict[str, str]]], table_name: str) -
 
 
 def build_source_query(source_table: str, source_columns: Sequence[str]) -> str:
-    columns = ", ".join(str(column).strip() for column in source_columns if str(column).strip())
+    columns = [str(column).strip() for column in source_columns if str(column).strip()]
     if not columns:
         raise ValueError(f"No source columns provided for table: {source_table}")
-    return f"SELECT {columns} FROM {source_table};"
+
+    def quote_identifier(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    quoted_columns = ", ".join(quote_identifier(column) for column in columns)
+    return f"SELECT {quoted_columns} FROM {quote_identifier(source_table.strip())}"
 
 
 def build_insert_sql(table_name: str, target_columns: Sequence[str], schema_name: str | None = None) -> str:

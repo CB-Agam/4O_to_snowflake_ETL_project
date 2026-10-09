@@ -47,9 +47,19 @@ def run_for_table(excel_path: str, sheet_name: str, target_table: str | None = N
                 if not rows:
                     continue
 
-                source_table = rows[0]["source_table"]
-                source_columns = [row["source_column"] for row in rows]
-                target_columns = [row["target_column"] for row in rows]
+                source_rows = [
+                    row
+                    for row in rows
+                    if row["source_table"].strip()
+                    and row["source_column"].strip()
+                    and row["target_column"].strip()
+                ]
+                if not source_rows:
+                    raise ValueError(f"No complete source-to-target column mappings for table: {table_name}")
+
+                source_table = source_rows[0]["source_table"]
+                source_columns = [row["source_column"] for row in source_rows]
+                target_columns = [row["target_column"] for row in source_rows]
 
                 query = build_source_query(source_table, source_columns)
                 df = pd.read_sql(query, fourd_conn)

@@ -18,10 +18,6 @@ def connect_to_4d():
 
     try:
         connection = pyodbc.connect(conn_str, timeout=30)
-        cursor = connection.cursor()
-        cursor.execute("SELECT 1")
-        cursor.fetchone()
-        cursor.close()
         logger.info("4D connection successful")
         return connection
     except pyodbc.Error as exc:
