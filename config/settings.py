@@ -32,7 +32,6 @@ class Settings:
         required = {
             "FOURD_SERVER": self.fourd_server,
             "FOURD_PORT": self.fourd_port,
-            "FOURD_DATABASE": self.fourd_database,
             "FOURD_USERNAME": self.fourd_username,
             "FOURD_PASSWORD": self.fourd_password,
         }
@@ -57,7 +56,20 @@ class Settings:
 
     def fourd_connection_string(self):
         if self.fourd_dsn:
-            return f"DSN={self.fourd_dsn};UID={self.fourd_username};PWD={self.fourd_password};DATABASE={self.fourd_database};SERVER={self.fourd_server};PORT={self.fourd_port}"
+            connection_parts = [
+                f"DSN={self.fourd_dsn};",
+                f"UID={self.fourd_username};",
+                f"PWD={self.fourd_password};",
+            ]
+            if self.fourd_database:
+                connection_parts.append(f"DATABASE={self.fourd_database};")
+            connection_parts.extend(
+                [
+                    f"SERVER={self.fourd_server};",
+                    f"PORT={self.fourd_port};",
+                ]
+            )
+            return "".join(connection_parts)
 
         driver = self.fourd_driver or "{4D v18 ODBC Driver 64-bit}"
         connection_parts = [

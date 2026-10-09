@@ -4,9 +4,25 @@ import pandas as pd
 
 from etl.ddl import build_create_table_sql
 from etl.metadata import table_metadata_from_dataframe
+from config.settings import Settings
 
 
 class EtlCoreTests(unittest.TestCase):
+    def test_4d_connection_string_does_not_require_database(self):
+        settings = Settings()
+        settings.fourd_server = "server"
+        settings.fourd_port = "19813"
+        settings.fourd_username = "username"
+        settings.fourd_password = "test_password"
+        settings.fourd_database = ""
+
+        connection_string = settings.fourd_connection_string()
+
+        self.assertEqual(settings.missing_4d_settings(), [])
+        self.assertIn("UID=username;", connection_string)
+        self.assertIn("PWD=test_password;", connection_string)
+        self.assertNotIn("DATABASE=", connection_string)
+
     def test_table_metadata_from_dataframe_builds_grouped_rows(self):
         df = pd.DataFrame([
             {
@@ -14,7 +30,7 @@ class EtlCoreTests(unittest.TestCase):
                 "Source column": "Cheque_ID_NO",
                 "Target table": "ACC_CHEQUE_PAYMENTS",
                 "Target column": "CHEQUE_ID_NO",
-                "Constraint": "PK",
+                "Constraints": "PK",
                 "Snowflake Datatype": "NUMBER(18,0)",
             },
             {
@@ -22,7 +38,7 @@ class EtlCoreTests(unittest.TestCase):
                 "Source column": "Amount",
                 "Target table": "ACC_CHEQUE_PAYMENTS",
                 "Target column": "AMOUNT",
-                "Constraint": "",
+                "Constraints": "",
                 "Snowflake Datatype": "NUMBER(18,2)",
             },
         ])
