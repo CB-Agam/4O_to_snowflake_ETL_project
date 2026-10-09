@@ -1,0 +1,4 @@
+python-dotenv>=1.0.0
+pyodbc>=5.1.0
+snowflake-connector-python>=3.12.0
+pandas>=2.2.0
