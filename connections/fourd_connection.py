@@ -18,6 +18,10 @@ def connect_to_4d():
 
     try:
         connection = pyodbc.connect(conn_str, timeout=30)
+        if settings.fourd_query_timeout_seconds <= 0:
+            connection.close()
+            raise ValueError("FOURD_QUERY_TIMEOUT_SECONDS must be greater than zero")
+        connection.timeout = settings.fourd_query_timeout_seconds
         logger.info("4D connection successful")
         return connection
     except pyodbc.Error as exc:

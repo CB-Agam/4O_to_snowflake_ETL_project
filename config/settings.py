@@ -18,6 +18,7 @@ class Settings:
         self.fourd_password = os.getenv("FOURD_PASSWORD", "")
         self.fourd_dsn = os.getenv("FOURD_DSN", "")
         self.fourd_driver = os.getenv("FOURD_DRIVER", "")
+        self.fourd_query_timeout_seconds = int(os.getenv("FOURD_QUERY_TIMEOUT_SECONDS", "1800"))
 
         self.snowflake_account = os.getenv("SNOWFLAKE_ACCOUNT", "")
         self.snowflake_user = os.getenv("SNOWFLAKE_USER", "")

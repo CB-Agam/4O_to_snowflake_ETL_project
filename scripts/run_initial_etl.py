@@ -86,7 +86,7 @@ def run_for_table(excel_path: str, sheet_name: str, target_table: str | None = N
         snowflake_conn.close()
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create missing Snowflake tables from the Excel mapping and load data from 4D.")
     parser.add_argument("--excel", default=str(DEFAULT_EXCEL_PATH), help="Path to the Excel mapping workbook")
     parser.add_argument(
@@ -94,11 +94,21 @@ def main() -> int:
         default=None,
         help="Excel sheet name to read (defaults to --table, or Snowflake_table_names)",
     )
-    parser.add_argument("--table", default=None, help="Optional target table name to process. If omitted, process all tables.")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--table",
+        nargs="+",
+        default=None,
+        help="Optional target table name to process. Multiword names may be quoted or unquoted.",
+    )
+    return parser.parse_args(argv)
 
-    sheet_name = args.sheet or args.table or "Snowflake_table_names"
-    result = run_for_table(args.excel, sheet_name, args.table)
+
+def main() -> int:
+    args = _parse_args()
+    table_name = " ".join(args.table) if args.table else None
+
+    sheet_name = args.sheet or table_name or "Snowflake_table_names"
+    result = run_for_table(args.excel, sheet_name, table_name)
     for item in result["tables"]:
         print(f"Loaded {item['rows_loaded']} rows into {item['table']} from {item['source_table']}")
 

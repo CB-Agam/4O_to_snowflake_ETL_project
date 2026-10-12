@@ -8,9 +8,15 @@ from etl.metadata import table_metadata_from_dataframe
 from config.settings import Settings
 from connections.fourd_connection import connect_to_4d
 from etl.load import build_source_query
+from scripts.run_initial_etl import _parse_args
 
 
 class EtlCoreTests(unittest.TestCase):
+    def test_cli_accepts_unquoted_multiword_table_name(self):
+        args = _parse_args(["--table", "Accounts", "Aging", "Item"])
+
+        self.assertEqual(" ".join(args.table), "Accounts Aging Item")
+
     @patch("connections.fourd_connection.pyodbc.connect")
     @patch("connections.fourd_connection.settings")
     def test_connect_to_4d_does_not_execute_probe_query(self, settings, connect):
@@ -18,6 +24,7 @@ class EtlCoreTests(unittest.TestCase):
         settings.fourd_connection_string.return_value = "DRIVER=test;"
         settings.fourd_server = "server"
         settings.fourd_port = "19813"
+        settings.fourd_query_timeout_seconds = 1800
         connection = Mock()
         connect.return_value = connection
 
@@ -25,6 +32,7 @@ class EtlCoreTests(unittest.TestCase):
 
         self.assertIs(result, connection)
         connect.assert_called_once_with("DRIVER=test;", timeout=30)
+        self.assertEqual(connection.timeout, 1800)
         connection.cursor.assert_not_called()
 
     def test_4d_connection_string_does_not_require_database(self):

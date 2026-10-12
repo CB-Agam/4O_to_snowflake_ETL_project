@@ -18,6 +18,8 @@ The first step is to validate the two required connections before implementing e
 
 1. Copy .env.example to .env
 2. Fill in the real values for your 4D and Snowflake environment
+   - `FOURD_QUERY_TIMEOUT_SECONDS` is optional; it defaults to `1800` (30 minutes).
+     A 4D query that exceeds this limit will be cancelled by the ODBC driver.
 3. Install requirements:
 
 ```powershell
