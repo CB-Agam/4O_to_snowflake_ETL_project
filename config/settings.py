@@ -20,6 +20,15 @@ class Settings:
         self.fourd_driver = os.getenv("FOURD_DRIVER", "")
         self.fourd_query_timeout_seconds = int(os.getenv("FOURD_QUERY_TIMEOUT_SECONDS", "1800"))
 
+        self.sftp_host = os.getenv("SFTP_HOST", "")
+        self.sftp_port = int(os.getenv("SFTP_PORT", "22"))
+        self.sftp_username = os.getenv("SFTP_USERNAME", "")
+        self.sftp_password = os.getenv("SFTP_PASSWORD", "")
+        self.sftp_private_key_file = os.getenv("SFTP_PRIVATE_KEY_FILE", "")
+        self.sftp_private_key_passphrase = os.getenv("SFTP_PRIVATE_KEY_PASSPHRASE", "")
+        self.sftp_known_hosts_file = os.getenv("SFTP_KNOWN_HOSTS_FILE", "")
+        self.sftp_remote_dir = os.getenv("SFTP_REMOTE_DIR", "/")
+
         self.snowflake_account = os.getenv("SNOWFLAKE_ACCOUNT", "")
         self.snowflake_user = os.getenv("SNOWFLAKE_USER", "")
         self.snowflake_password = os.getenv("SNOWFLAKE_PASSWORD", "")
@@ -28,6 +37,9 @@ class Settings:
         self.snowflake_schema = os.getenv("SNOWFLAKE_SCHEMA", "")
         self.snowflake_role = os.getenv("SNOWFLAKE_ROLE", "")
         self.snowflake_authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR", "externalbrowser")
+        self.snowflake_pipe_private_key_file = os.getenv("SNOWFLAKE_PIPE_PRIVATE_KEY_FILE", "")
+        self.snowflake_pipe_private_key_passphrase = os.getenv("SNOWFLAKE_PIPE_PRIVATE_KEY_PASSPHRASE", "")
+        self.snowflake_pipe_host = os.getenv("SNOWFLAKE_PIPE_HOST", "")
 
     def missing_4d_settings(self):
         required = {
@@ -49,10 +61,20 @@ class Settings:
             "SNOWFLAKE_ROLE": self.snowflake_role,
         }
 
-        if self.snowflake_authenticator != "externalbrowser":
+        if not self.snowflake_pipe_private_key_file and self.snowflake_authenticator != "externalbrowser":
             required["SNOWFLAKE_PASSWORD"] = self.snowflake_password
 
         missing = [name for name, value in required.items() if not value]
+        return missing
+
+    def missing_sftp_settings(self):
+        required = {
+            "SFTP_HOST": self.sftp_host,
+            "SFTP_USERNAME": self.sftp_username,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if not self.sftp_password and not self.sftp_private_key_file:
+            missing.append("SFTP_PASSWORD or SFTP_PRIVATE_KEY_FILE")
         return missing
 
     def fourd_connection_string(self):
@@ -92,9 +114,14 @@ class Settings:
             "database": self.snowflake_database,
             "schema": self.snowflake_schema,
             "role": self.snowflake_role,
-            "authenticator": self.snowflake_authenticator,
         }
-        if self.snowflake_password:
+        if self.snowflake_pipe_private_key_file:
+            config["private_key_file"] = self.snowflake_pipe_private_key_file
+            if self.snowflake_pipe_private_key_passphrase:
+                config["private_key_file_pwd"] = self.snowflake_pipe_private_key_passphrase
+        else:
+            config["authenticator"] = self.snowflake_authenticator
+        if self.snowflake_password and not self.snowflake_pipe_private_key_file:
             config["password"] = self.snowflake_password
         return config
 

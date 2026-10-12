@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 def connect_to_snowflake():
-    """Open a reusable Snowflake connection using account, user, password, role, warehouse, database, and schema."""
+    """Open a reusable Snowflake connection using the configured authenticator."""
     missing = settings.missing_snowflake_settings()
     if missing:
         raise ValueError(f"Missing Snowflake environment variables: {', '.join(missing)}")

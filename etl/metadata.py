@@ -34,6 +34,7 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
     source_column_name = _pick_column_name(columns, "source column", "source_column", "Source column", "column")
     target_table_name = _pick_column_name(columns, "target table", "target_table", "Target table")
     target_column_name = _pick_column_name(columns, "target column", "target_column", "Target column")
+    transformation_name = _pick_column_name(columns, "transformation")
     snowflake_datatype_name = _pick_column_name(
         columns,
         "snowflake datatype",
@@ -69,6 +70,7 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
                 "source_column": source_column,
                 "target_table": _normalize_table_name(target_table),
                 "target_column": target_column,
+                "transformation": _normalize_text(row.get(transformation_name)) if transformation_name else "",
                 "snowflake_datatype": snowflake_type or "VARCHAR",
                 "constraint": constraint,
             }
