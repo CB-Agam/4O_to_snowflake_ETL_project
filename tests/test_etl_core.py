@@ -1,5 +1,7 @@
 import unittest
 import tempfile
+from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -7,21 +9,37 @@ import simplejson as json
 import pandas as pd
 
 from etl.ddl import build_create_table_sql
+from etl.daily_snapshot import (
+    _snowflake_copy_rows,
+    extract_4d_table_to_json,
+    publish_json_snapshot,
+)
 from etl.metadata import table_metadata_from_dataframe
 from config.settings import Settings
 from connections.fourd_connection import connect_to_4d
 from etl.load import build_source_query
 from etl.sftp_snowpipe import (
+    create_batch_audit_table,
     create_snowpipe_objects,
+    finish_batch_audit,
+    find_local_table_json_files,
     find_table_json_files,
     map_json_export_to_target,
     snowpipe_object_names,
     stage_and_submit_json_file,
+    start_batch_audit,
     transform_json_file,
 )
+from scripts.run_sftp_snowpipe import _parse_args
 
 
 class EtlCoreTests(unittest.TestCase):
+    def test_snowpipe_cli_defaults_to_local_exports(self):
+        args = _parse_args(["--table", "Accounts", "Aging", "Item"])
+
+        self.assertEqual(args.source, "local")
+        self.assertEqual(args.table, ["Accounts", "Aging", "Item"])
+
     @patch("connections.fourd_connection.pyodbc.connect")
     @patch("connections.fourd_connection.settings")
     def test_connect_to_4d_does_not_execute_probe_query(self, settings, connect):
@@ -185,6 +203,133 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(str(output[0]["AMOUNT"]), "0.1234567890123456789")
 
+    def test_extract_4d_table_to_json_writes_complete_atomic_json(self):
+        connection = Mock()
+        cursor = connection.cursor.return_value
+        cursor.fetchmany.side_effect = [
+            [(Decimal("123.45"), datetime(2026, 10, 12, 9, 30))],
+            [],
+        ]
+        rows = [
+            {
+                "source_table": "Accounts Aging Item",
+                "source_column": "Amount",
+                "target_column": "AMOUNT",
+            },
+            {
+                "source_table": "Accounts Aging Item",
+                "source_column": "Due Date",
+                "target_column": "DUE_DATE",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            export_path = Path(directory) / "ACCOUNTS_AGING_ITEM_20261012.json"
+
+            count = extract_4d_table_to_json(connection, rows, export_path, fetch_size=1)
+            result = json.loads(export_path.read_text(encoding="utf-8"), use_decimal=True)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(str(result[0]["Amount"]), "123.45")
+        self.assertEqual(result[0]["Due Date"], "2026-10-12T09:30:00")
+        self.assertFalse(export_path.with_name(export_path.name + ".partial").exists())
+        self.assertIn('SELECT "Amount", "Due Date"', cursor.execute.call_args.args[0])
+        cursor.close.assert_called_once()
+
+    def test_snowflake_copy_response_counts_loaded_rows(self):
+        cursor = Mock()
+        cursor.description = [("rows_loaded",), ("errors_seen",)]
+        cursor.fetchall.return_value = [(12, 0)]
+
+        loaded = _snowflake_copy_rows(
+            cursor,
+            '"DW"."RAW"."ETL_LOAD_BATCH"',
+            '"DW"."RAW"."ETL_ACCOUNTS_STAGE"',
+            "BATCH.json",
+        )
+
+        self.assertEqual(loaded, 12)
+        self.assertIn("COPY INTO", cursor.execute.call_args.args[0])
+
+    @patch("etl.daily_snapshot.transform_json_file", return_value=2)
+    @patch("etl.daily_snapshot.table_exists_in_snowflake", return_value=True)
+    @patch("etl.daily_snapshot.create_missing_tables_from_metadata")
+    @patch("etl.daily_snapshot.start_batch_audit")
+    @patch("etl.daily_snapshot.create_batch_audit_table")
+    @patch("etl.daily_snapshot.finish_batch_audit")
+    def test_publish_snapshot_archives_current_only_after_copy_is_validated(
+        self,
+        finish_audit,
+        create_audit,
+        start_audit,
+        create_target,
+        table_exists,
+        transform,
+    ):
+        class Cursor:
+            def __init__(self):
+                self.statements = []
+                self.description = None
+                self._rows = []
+
+            def execute(self, sql, *args):
+                self.statements.append(sql)
+                if sql.startswith("PUT "):
+                    self.description = [("status",), ("message",)]
+                    self._rows = [("UPLOADED", "")]
+                elif sql.startswith("COPY INTO"):
+                    self.description = [("rows_loaded",), ("errors_seen",)]
+                    self._rows = [(2, 0)]
+                else:
+                    self.description = None
+                    self._rows = []
+
+            def fetchall(self):
+                return self._rows
+
+            def close(self):
+                pass
+
+        cursor = Cursor()
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        rows = [
+            {
+                "source_table": "Accounts Aging Item",
+                "source_column": "Amount",
+                "target_column": "AMOUNT",
+                "snowflake_datatype": "NUMBER(10,2)",
+                "constraint": "",
+                "transformation": "",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = publish_json_snapshot(
+                connection,
+                "DW",
+                "RAW",
+                "ACCOUNTS_AGING_ITEM",
+                rows,
+                Path(directory) / "input.json",
+                "12345678-1234-5678-1234-567812345678",
+                2,
+            )
+
+        copy_position = next(i for i, sql in enumerate(cursor.statements) if sql.startswith("COPY INTO"))
+        history_position = next(
+            i for i, sql in enumerate(cursor.statements) if " CLONE " in sql and "_HS_" in sql
+        )
+        publish_position = next(
+            i
+            for i, sql in enumerate(cursor.statements)
+            if sql.startswith("CREATE OR REPLACE TABLE") and " CLONE " in sql
+        )
+        self.assertLess(copy_position, history_position)
+        self.assertLess(history_position, publish_position)
+        self.assertEqual(result["rows_loaded"], 2)
+        self.assertTrue(result["history_table"].startswith("ACCOUNTS_AGING_ITEM_HS_"))
+        finish_audit.assert_called_once()
+
     def test_stage_and_submit_uploads_file_and_queues_it(self):
         connection = Mock()
         cursor = connection.cursor.return_value
@@ -226,6 +371,30 @@ class EtlCoreTests(unittest.TestCase):
             [("Accounts_Aging_Item_20261012.json", "/exports/Accounts_Aging_Item_20261012.json")],
         )
 
+    def test_find_local_table_json_files_matches_table_and_ignores_other_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            export_dir = Path(directory)
+            (export_dir / "Accounts_Aging_Item_20261012.json").write_text("[]", encoding="utf-8")
+            (export_dir / "Other_Table.json").write_text("[]", encoding="utf-8")
+            (export_dir / "Accounts_Aging_Item.partial").write_text("[]", encoding="utf-8")
+            (export_dir / "ignored.json").mkdir()
+
+            files = find_local_table_json_files(export_dir, ["Accounts Aging Item"])
+
+        self.assertEqual(
+            files,
+            [("Accounts_Aging_Item_20261012.json", str(export_dir / "Accounts_Aging_Item_20261012.json"))],
+        )
+
+    def test_find_local_table_json_files_creates_missing_export_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing_dir = Path(directory) / "missing"
+            files = find_local_table_json_files(missing_dir, ["Accounts Aging Item"])
+            directory_created = missing_dir.is_dir()
+
+        self.assertEqual(files, [])
+        self.assertTrue(directory_created)
+
     def test_create_snowpipe_objects_creates_table_specific_stage_and_pipe(self):
         cursor = Mock()
         objects = snowpipe_object_names("DW", "RAW", "ACCOUNTS_AGING_ITEM")
@@ -237,6 +406,42 @@ class EtlCoreTests(unittest.TestCase):
         pipe_sql = cursor.execute.call_args_list[1].args[0]
         self.assertIn("STRIP_OUTER_ARRAY=TRUE", pipe_sql)
         self.assertIn("MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE", pipe_sql)
+
+    def test_batch_audit_helpers_create_and_update_run_record(self):
+        cursor = Mock()
+        objects = snowpipe_object_names("DW", "RAW", "ACCOUNTS_AGING_ITEM")
+
+        create_batch_audit_table(cursor, objects["audit_table"])
+        start_batch_audit(
+            cursor,
+            objects["audit_table"],
+            "batch-123",
+            "ACCOUNTS_AGING_ITEM",
+            "local",
+            2,
+        )
+        finish_batch_audit(
+            cursor,
+            objects["audit_table"],
+            "batch-123",
+            "QUEUED",
+            2,
+            42,
+        )
+
+        create_sql = cursor.execute.call_args_list[0].args[0]
+        insert_call = cursor.execute.call_args_list[1]
+        update_call = cursor.execute.call_args_list[2]
+        self.assertIn('"DW"."RAW"."ETL_BATCH_AUDIT"', create_sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS", create_sql)
+        self.assertEqual(
+            insert_call.args[1],
+            ("batch-123", "ACCOUNTS_AGING_ITEM", "LOCAL", 2),
+        )
+        self.assertEqual(
+            update_call.args[1],
+            ("QUEUED", 2, 42, None, "batch-123"),
+        )
 
 
 if __name__ == "__main__":

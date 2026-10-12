@@ -28,6 +28,10 @@ class Settings:
         self.sftp_private_key_passphrase = os.getenv("SFTP_PRIVATE_KEY_PASSPHRASE", "")
         self.sftp_known_hosts_file = os.getenv("SFTP_KNOWN_HOSTS_FILE", "")
         self.sftp_remote_dir = os.getenv("SFTP_REMOTE_DIR", "/")
+        self.local_export_dir = os.getenv(
+            "LOCAL_EXPORT_DIR",
+            str(BASE_DIR / "data" / "exports"),
+        )
 
         self.snowflake_account = os.getenv("SNOWFLAKE_ACCOUNT", "")
         self.snowflake_user = os.getenv("SNOWFLAKE_USER", "")

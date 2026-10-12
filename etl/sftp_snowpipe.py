@@ -45,6 +45,21 @@ def find_table_json_files(sftp_client, remote_dir: str, table_names: Iterable[st
     return sorted(matches)
 
 
+def find_local_table_json_files(export_dir: Path, table_names: Iterable[str]) -> list[tuple[str, str]]:
+    export_dir = export_dir.expanduser().resolve()
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    normalized_names = [_normalize_filename(name) for name in table_names if name]
+    matches = []
+    for path in export_dir.iterdir():
+        if not path.is_file() or path.suffix.casefold() != ".json":
+            continue
+        normalized_stem = _normalize_filename(path.stem)
+        if any(normalized_stem.startswith(name) for name in normalized_names):
+            matches.append((path.name, str(path)))
+    return sorted(matches)
+
+
 def iter_json_export_to_target(
     records: Iterable[Any],
     metadata_rows: Sequence[dict[str, str]],
@@ -108,6 +123,17 @@ def download_sftp_file(sftp_client, remote_path: str, local_path: Path) -> str:
     return digest.hexdigest()
 
 
+def hash_local_file(local_path: Path) -> str:
+    digest = hashlib.sha256()
+    with local_path.open("rb") as source_file:
+        while True:
+            chunk = source_file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def transform_json_file(
     source_path: Path,
     target_path: Path,
@@ -156,12 +182,58 @@ def snowpipe_object_names(database: str, schema: str, target_table: str) -> dict
     qualified_table = _quote_identifier(target_table)
     qualified_stage = _quote_identifier(stage)
     qualified_pipe = _quote_identifier(pipe)
+    audit_table = _quote_identifier("ETL_BATCH_AUDIT")
     return {
         "table": f"{qualified_database}.{qualified_schema}.{qualified_table}",
         "stage": f"{qualified_database}.{qualified_schema}.{qualified_stage}",
         "pipe": f"{qualified_database}.{qualified_schema}.{qualified_pipe}",
         "pipe_api": f"{database}.{schema}.{pipe}",
+        "audit_table": f"{qualified_database}.{qualified_schema}.{audit_table}",
     }
+
+
+def create_batch_audit_table(cursor, audit_table: str) -> None:
+    cursor.execute(
+        f"CREATE TABLE IF NOT EXISTS {audit_table} ("
+        "BATCH_ID VARCHAR NOT NULL, "
+        "TARGET_TABLE VARCHAR NOT NULL, "
+        "SOURCE_TYPE VARCHAR NOT NULL, "
+        "STATUS VARCHAR NOT NULL, "
+        "FILES_DISCOVERED NUMBER(38,0) NOT NULL, "
+        "FILES_QUEUED NUMBER(38,0) NOT NULL, "
+        "ROWS_QUEUED NUMBER(38,0) NOT NULL, "
+        "STARTED_AT TIMESTAMP_TZ NOT NULL, "
+        "COMPLETED_AT TIMESTAMP_TZ, "
+        "ERROR_MESSAGE VARCHAR(4000)"
+        ")"
+    )
+
+
+def start_batch_audit(cursor, audit_table: str, batch_id: str, table: str, source: str, file_count: int) -> None:
+    cursor.execute(
+        f"INSERT INTO {audit_table} "
+        "(BATCH_ID, TARGET_TABLE, SOURCE_TYPE, STATUS, FILES_DISCOVERED, "
+        "FILES_QUEUED, ROWS_QUEUED, STARTED_AT) "
+        "VALUES (%s, %s, %s, 'PROCESSING', %s, 0, 0, CURRENT_TIMESTAMP())",
+        (batch_id, table, source.upper(), file_count),
+    )
+
+
+def finish_batch_audit(
+    cursor,
+    audit_table: str,
+    batch_id: str,
+    status: str,
+    files_queued: int,
+    rows_queued: int,
+    error_message: str | None = None,
+) -> None:
+    cursor.execute(
+        f"UPDATE {audit_table} SET STATUS = %s, FILES_QUEUED = %s, "
+        "ROWS_QUEUED = %s, COMPLETED_AT = CURRENT_TIMESTAMP(), ERROR_MESSAGE = %s "
+        "WHERE BATCH_ID = %s",
+        (status, files_queued, rows_queued, error_message, batch_id),
+    )
 
 
 def create_snowpipe_objects(cursor, objects: dict[str, str]) -> None:
