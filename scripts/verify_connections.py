@@ -8,14 +8,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from connections.fourd_connection import connect_to_4d, close_4d_connection
 from connections.snowflake_connection import connect_to_snowflake, close_snowflake_connection
+from config.logging_config import configure_logging as configure_pipeline_logging
 
 
 def configure_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.StreamHandler()],
-    )
+    configure_pipeline_logging()
 
 
 def main():
@@ -29,14 +26,14 @@ def main():
         try:
             fourd_conn = connect_to_4d()
             logger.info("[OK] 4D connection test succeeded")
-        except Exception as exc:
-            logger.error("[FAIL] 4D connection test failed: %s", exc)
+        except Exception:
+            logger.exception("[FAIL] 4D connection test failed")
 
         try:
             snowflake_conn = connect_to_snowflake()
             logger.info("[OK] Snowflake connection test succeeded")
-        except Exception as exc:
-            logger.error("[FAIL] Snowflake connection test failed: %s", exc)
+        except Exception:
+            logger.exception("[FAIL] Snowflake connection test failed")
 
         if fourd_conn is None or snowflake_conn is None:
             logger.error("One or both connection checks failed. Review your environment variables and driver setup.")
@@ -48,14 +45,14 @@ def main():
         if fourd_conn is not None:
             try:
                 close_4d_connection(fourd_conn)
-            except Exception as exc:
-                logger.error("Failed to close 4D connection cleanly: %s", exc)
+            except Exception:
+                logger.exception("Failed to close 4D connection cleanly")
 
         if snowflake_conn is not None:
             try:
                 close_snowflake_connection(snowflake_conn)
-            except Exception as exc:
-                logger.error("Failed to close Snowflake connection cleanly: %s", exc)
+            except Exception:
+                logger.exception("Failed to close Snowflake connection cleanly")
 
 
 if __name__ == "__main__":

@@ -59,6 +59,8 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
 
         if not source_table and not target_table and not source_column and not target_column:
             continue
+        if target_column.casefold() == "not in snowflake":
+            continue
 
         snowflake_type = _normalize_text(row.get(snowflake_datatype_name)) if snowflake_datatype_name else "VARCHAR"
         constraint = _normalize_text(row.get(constraint_name)) if constraint_name else ""
