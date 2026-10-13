@@ -16,6 +16,7 @@ from etl.sftp_snowpipe import (
     snowpipe_object_names,
     start_batch_audit,
     transform_json_file,
+    _local_file_uri,
 )
 
 logger = logging.getLogger(__name__)
@@ -180,7 +181,7 @@ def publish_json_snapshot(
                 f"JSON mapping produced {transformed_rows} row(s), but 4D extraction produced {expected_rows}"
             )
 
-        source_uri = transformed_path.resolve().as_uri().replace("'", "''")
+        source_uri = _local_file_uri(transformed_path).replace("'", "''")
         cursor.execute(
             f"PUT '{source_uri}' @{stage_name} "
             "AUTO_COMPRESS=FALSE OVERWRITE=TRUE"

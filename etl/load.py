@@ -18,9 +18,10 @@ def build_source_query(source_table: str, source_columns: Sequence[str]) -> str:
         raise ValueError(f"No source columns provided for table: {source_table}")
 
     def quote_identifier(identifier: str) -> str:
-        return '"' + identifier.replace('"', '""') + '"'
+        return "[" + identifier.replace("]", "]]" ) + "]"
 
     quoted_columns = ", ".join(quote_identifier(column) for column in columns)
+    print("QUERY CHANGES>>>>", f"SELECT {quoted_columns} FROM {quote_identifier(source_table.strip())}")
     return f"SELECT {quoted_columns} FROM {quote_identifier(source_table.strip())}"
 
 

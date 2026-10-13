@@ -24,6 +24,7 @@ from etl.sftp_snowpipe import (
     finish_batch_audit,
     find_local_table_json_files,
     find_table_json_files,
+    _local_file_uri,
     map_json_export_to_target,
     snowpipe_object_names,
     stage_and_submit_json_file,
@@ -34,6 +35,14 @@ from scripts.run_sftp_snowpipe import _parse_args
 
 
 class EtlCoreTests(unittest.TestCase):
+    def test_local_file_uri_preserves_spaces(self):
+        uri = _local_file_uri(Path("folder with spaces") / "data.json")
+
+        self.assertIn("folder with spaces", uri)
+        self.assertNotIn("%20", uri)
+        if Path.cwd().drive:
+            self.assertTrue(uri.startswith(f"file://{Path.cwd().drive}/"))
+
     def test_snowpipe_cli_defaults_to_local_exports(self):
         args = _parse_args(["--table", "Accounts", "Aging", "Item"])
 
@@ -123,13 +132,13 @@ class EtlCoreTests(unittest.TestCase):
     def test_build_source_query_quotes_identifiers_and_skips_blank_columns(self):
         query = build_source_query(
             "Acc_Cheque_Payments",
-            ["Cheque_ID_No", "Cheque Date", "", "Name \"With\" Quotes"],
+            ["Cheque_ID_No", "Cheque Date", "", "Name ] With Bracket"],
         )
 
         self.assertEqual(
             query,
-            'SELECT "Cheque_ID_No", "Cheque Date", "Name ""With"" Quotes" '
-            'FROM "Acc_Cheque_Payments"',
+            "SELECT [Cheque_ID_No], [Cheque Date], [Name ]] With Bracket] "
+            "FROM [Acc_Cheque_Payments]",
         )
 
     def test_build_create_table_sql_includes_primary_key(self):
@@ -232,7 +241,7 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(str(result[0]["Amount"]), "123.45")
         self.assertEqual(result[0]["Due Date"], "2026-10-12T09:30:00")
         self.assertFalse(export_path.with_name(export_path.name + ".partial").exists())
-        self.assertIn('SELECT "Amount", "Due Date"', cursor.execute.call_args.args[0])
+        self.assertIn("SELECT [Amount], [Due Date]", cursor.execute.call_args.args[0])
         cursor.close.assert_called_once()
 
     def test_snowflake_copy_response_counts_loaded_rows(self):

@@ -25,6 +25,10 @@ def _quote_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
+def _local_file_uri(path: Path) -> str:
+    return f"file://{path.resolve().as_posix()}"
+
+
 def _normalize_filename(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", value).casefold()
 
@@ -288,7 +292,7 @@ def stage_and_submit_json_file(
 ) -> str:
     staged_filename = f"{content_hash}.json"
 
-    source_uri = staged_file_path.resolve().as_uri().replace("'", "''")
+    source_uri = _local_file_uri(staged_file_path).replace("'", "''")
     cursor = snowflake_connection.cursor()
     try:
         cursor.execute(
