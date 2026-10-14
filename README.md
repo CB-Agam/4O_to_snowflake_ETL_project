@@ -1,10 +1,6 @@
 # 4D to Snowflake ETL
 
-This project is being built incrementally. The current milestone focuses only on proving that Python can connect successfully to both the 4D database and Snowflake.
-
-## Current milestone
-
-The first step is to validate the two required connections before implementing extraction, transformation, staging, history, or production refresh logic.
+This project loads mapped data directly from 4D into Snowflake using the Excel workbook as mapping metadata.
 
 ## Project structure
 
@@ -38,9 +34,16 @@ py -3.12 scripts\verify_connections.py
 py -3.12 scripts\run_initial_etl.py --table ACCOUNT_CONTACTS
 ```
 
+Load multiple mapped tables in one run (one Snowflake and 4D connection, with a
+single run ID in the audit log):
+
+```powershell
+py -3.12 scripts\run_initial_etl.py --tables ACCOUNTS_AGING_ITEM Reports Account_Contacts
+```
+
 The runner selects the worksheet matching the target table name. You can pass
 `--sheet "Worksheet Name"` if the worksheet uses a different name. The ETL
-inserts rows; check the Snowflake target before rerunning to avoid duplicates.
+inserts rows; check the Snowflake targets before rerunning to avoid duplicates.
 
 Pipeline output is shown in the console and saved to `logs/etl_pipeline.log`.
 Errors include full tracebacks; the log rotates at 5 MB and keeps up to five
@@ -49,10 +52,26 @@ review.
 
 The ETL runner also creates and writes step-level audit records to
 `<SNOWFLAKE_DATABASE>.<SNOWFLAKE_SCHEMA>.ETL_PIPELINE_LOG`. The table contains
-an identity sequence number, run ID, table, step, status, message, full error
-details, and event timestamp. The Snowflake log records steps after Snowflake
-is connected and the log table is available; earlier failures are retained in
-the local file log.
+a run ID, a per-run step number, table, step, status, message, full error
+details, and event timestamp. Run IDs are unique per ETL invocation; order
+events within a run by `RUN_STEP_NO`. The table migration removes the former
+global `S_NO` column. The Snowflake log records steps after Snowflake is
+connected and the log table is available; earlier failures are retained in the
+local file log.
+
+For mapped source columns with 4D type `CLOB`, the initial ETL widens bounded
+Snowflake `VARCHAR(n)` targets to unbounded `VARCHAR` in new table definitions
+and alters existing target columns before loading. The Snowflake role must
+have permission to alter those target tables.
+
+The initial ETL excludes a target column named `STATUS` from workbook mappings
+and drops an existing `STATUS` column from each selected Snowflake target table.
+Dropping the column also removes its existing data.
+`CREATED_TIMESTAMP` and `UPDATED_TIMESTAMP` are managed by Snowflake: new tables
+create them as `NOT NULL DEFAULT CURRENT_TIMESTAMP()`, and existing tables have
+nulls backfilled. Inserts explicitly use `CURRENT_TIMESTAMP()` for both fields,
+so they are populated for every inserted row without relying on altering
+defaults on existing tables.
 
 ## Important notes
 

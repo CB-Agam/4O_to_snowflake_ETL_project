@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import pandas as pd
 
-from etl.ddl import build_create_table_sql, is_primary_key
+from etl.ddl import build_create_table_sql
+
+_ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
 
 
 def get_table_rows(metadata: Dict[str, List[Dict[str, str]]], table_name: str) -> List[Dict[str, str]]:
@@ -25,11 +27,19 @@ def build_source_query(source_table: str, source_columns: Sequence[str]) -> str:
 
 
 def build_insert_sql(table_name: str, target_columns: Sequence[str], schema_name: str | None = None) -> str:
+    source_columns = [
+        column
+        for column in target_columns
+        if column.upper() not in _ETL_TIMESTAMP_COLUMNS
+    ]
+    inserted_columns = [*source_columns, *_ETL_TIMESTAMP_COLUMNS]
+
     qualified_name = table_name
     if schema_name:
         qualified_name = f"{schema_name}.{table_name}"
-    columns_sql = ", ".join(target_columns)
-    placeholders = ", ".join(["%s"] * len(target_columns))
+    columns_sql = ", ".join(inserted_columns)
+    values = ["%s"] * len(source_columns) + ["CURRENT_TIMESTAMP()"] * len(_ETL_TIMESTAMP_COLUMNS)
+    placeholders = ", ".join(values)
     return f"INSERT INTO {qualified_name} ({columns_sql}) VALUES ({placeholders})"
 
 
@@ -58,7 +68,11 @@ def load_dataframe_to_snowflake(
     if df.empty:
         return 0
 
-    ordered_columns = list(target_columns)
+    ordered_columns = [
+        column
+        for column in target_columns
+        if column.upper() not in _ETL_TIMESTAMP_COLUMNS
+    ]
     df = df.copy()
     df = df.loc[:, ordered_columns]
     rows = [tuple(_clean_value(value) for value in row) for row in df.itertuples(index=False, name=None)]

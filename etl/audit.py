@@ -21,6 +21,7 @@ class SnowflakeAuditLogger:
     def __init__(self, connection, database: str, schema: str):
         self.connection = connection
         self.run_id = str(uuid4())
+        self._step_number = 0
         qualified_table = ".".join(
             (
                 _quote_snowflake_identifier(database),
@@ -33,8 +34,8 @@ class SnowflakeAuditLogger:
     def ensure_table(self) -> None:
         sql = f"""
             CREATE TABLE IF NOT EXISTS {self.qualified_table} (
-                S_NO NUMBER(38, 0) AUTOINCREMENT START 1 INCREMENT 1,
                 RUN_ID VARCHAR(36) NOT NULL,
+                RUN_STEP_NO NUMBER(38, 0) NOT NULL,
                 TABLE_NAME VARCHAR(255),
                 STEP VARCHAR(100) NOT NULL,
                 STATUS VARCHAR(20) NOT NULL,
@@ -46,6 +47,13 @@ class SnowflakeAuditLogger:
         cursor = self.connection.cursor()
         try:
             cursor.execute(sql)
+            cursor.execute(
+                f"ALTER TABLE {self.qualified_table} "
+                "ADD COLUMN IF NOT EXISTS RUN_STEP_NO NUMBER(38, 0)"
+            )
+            cursor.execute(
+                f"ALTER TABLE {self.qualified_table} DROP COLUMN IF EXISTS S_NO"
+            )
         finally:
             cursor.close()
 
@@ -57,16 +65,25 @@ class SnowflakeAuditLogger:
         message: str | None = None,
         error_message: str | None = None,
     ) -> None:
+        self._step_number += 1
         sql = f"""
             INSERT INTO {self.qualified_table}
-                (RUN_ID, TABLE_NAME, STEP, STATUS, MESSAGE, ERROR_MESSAGE)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (RUN_ID, RUN_STEP_NO, TABLE_NAME, STEP, STATUS, MESSAGE, ERROR_MESSAGE)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         cursor = self.connection.cursor()
         try:
             cursor.execute(
                 sql,
-                (self.run_id, table_name, step, status, message, error_message),
+                (
+                    self.run_id,
+                    self._step_number,
+                    table_name,
+                    step,
+                    status,
+                    message,
+                    error_message,
+                ),
             )
         finally:
             cursor.close()

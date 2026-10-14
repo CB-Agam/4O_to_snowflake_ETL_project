@@ -32,6 +32,13 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
     columns = [str(column).strip() for column in df.columns]
     source_table_name = _pick_column_name(columns, "source table", "source_table", "Source table", "table")
     source_column_name = _pick_column_name(columns, "source column", "source_column", "Source column", "column")
+    source_data_type_name = _pick_column_name(
+        columns,
+        "4d datatype",
+        "4d data type",
+        "source datatype",
+        "source data type",
+    )
     target_table_name = _pick_column_name(columns, "target table", "target_table", "Target table")
     target_column_name = _pick_column_name(columns, "target column", "target_column", "Target column")
     snowflake_datatype_name = _pick_column_name(
@@ -59,9 +66,14 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
 
         if not source_table and not target_table and not source_column and not target_column:
             continue
-        if target_column.casefold() == "not in snowflake":
+        if target_column.casefold() in {"not in snowflake", "status"}:
             continue
 
+        source_data_type = (
+            _normalize_text(row.get(source_data_type_name)).upper()
+            if source_data_type_name
+            else ""
+        )
         snowflake_type = _normalize_text(row.get(snowflake_datatype_name)) if snowflake_datatype_name else "VARCHAR"
         constraint = _normalize_text(row.get(constraint_name)) if constraint_name else ""
 
@@ -69,6 +81,7 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
             {
                 "source_table": source_table,
                 "source_column": source_column,
+                "source_data_type": source_data_type,
                 "target_table": _normalize_table_name(target_table),
                 "target_column": target_column,
                 "snowflake_datatype": snowflake_type or "VARCHAR",
