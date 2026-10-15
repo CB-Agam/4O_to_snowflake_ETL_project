@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import traceback
 from collections.abc import Callable
+from datetime import datetime
 from typing import TypeVar
 from uuid import uuid4
 
@@ -41,6 +42,8 @@ class SnowflakeAuditLogger:
                 STATUS VARCHAR(20) NOT NULL,
                 MESSAGE VARCHAR,
                 ERROR_MESSAGE VARCHAR,
+                START_TIME TIMESTAMP_NTZ,
+                END_TIME TIMESTAMP_NTZ,
                 TIME_STAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
             )
         """
@@ -54,6 +57,14 @@ class SnowflakeAuditLogger:
             cursor.execute(
                 f"ALTER TABLE {self.qualified_table} DROP COLUMN IF EXISTS S_NO"
             )
+            cursor.execute(
+                f"ALTER TABLE {self.qualified_table} "
+                "ADD COLUMN IF NOT EXISTS START_TIME TIMESTAMP_NTZ"
+            )
+            cursor.execute(
+                f"ALTER TABLE {self.qualified_table} "
+                "ADD COLUMN IF NOT EXISTS END_TIME TIMESTAMP_NTZ"
+            )
         finally:
             cursor.close()
 
@@ -64,12 +75,17 @@ class SnowflakeAuditLogger:
         table_name: str | None = None,
         message: str | None = None,
         error_message: str | None = None,
-    ) -> None:
+        start_time: datetime | None = None,
+    ) -> int:
         self._step_number += 1
+        step_number = self._step_number
         sql = f"""
             INSERT INTO {self.qualified_table}
-                (RUN_ID, RUN_STEP_NO, TABLE_NAME, STEP, STATUS, MESSAGE, ERROR_MESSAGE)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (RUN_ID, RUN_STEP_NO, TABLE_NAME, STEP, STATUS, MESSAGE,
+                 ERROR_MESSAGE, START_TIME, END_TIME)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    COALESCE(%s, CURRENT_TIMESTAMP()),
+                    CASE WHEN %s = 'RUNNING' THEN NULL ELSE CURRENT_TIMESTAMP() END)
         """
         cursor = self.connection.cursor()
         try:
@@ -83,7 +99,34 @@ class SnowflakeAuditLogger:
                     status,
                     message,
                     error_message,
+                    start_time,
+                    status,
                 ),
+            )
+        finally:
+            cursor.close()
+        return step_number
+
+    def finish_step(
+        self,
+        step_number: int,
+        status: str,
+        message: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        sql = f"""
+            UPDATE {self.qualified_table}
+            SET STATUS = %s,
+                MESSAGE = %s,
+                ERROR_MESSAGE = %s,
+                END_TIME = CURRENT_TIMESTAMP()
+            WHERE RUN_ID = %s AND RUN_STEP_NO = %s
+        """
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (status, message, error_message, self.run_id, step_number),
             )
         finally:
             cursor.close()
@@ -94,16 +137,25 @@ class SnowflakeAuditLogger:
         action: Callable[[], _T],
         table_name: str | None = None,
     ) -> _T:
-        self.record(step, "STARTED", table_name, f"{step} started")
+        step_number = self.record(step, "RUNNING", table_name, f"{step} started")
         try:
             result = action()
+        except KeyboardInterrupt:
+            try:
+                self.finish_step(
+                    step_number,
+                    "INTERRUPTED",
+                    f"{step} interrupted",
+                )
+            except Exception:
+                logger.exception("Could not store interrupted step %s in Snowflake audit table", step)
+            raise
         except Exception as step_error:
             error_message = traceback.format_exc()
             try:
-                self.record(
-                    step,
-                    "FAILURE",
-                    table_name,
+                self.finish_step(
+                    step_number,
+                    "FAILED",
                     f"{step} failed: {step_error}",
                     error_message,
                 )
@@ -112,5 +164,9 @@ class SnowflakeAuditLogger:
                 raise step_error from audit_error
             raise
 
-        self.record(step, "SUCCESS", table_name, f"{step} completed successfully")
+        self.finish_step(
+            step_number,
+            "SUCCESS",
+            f"{step} completed successfully",
+        )
         return result

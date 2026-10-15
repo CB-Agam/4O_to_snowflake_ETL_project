@@ -33,22 +33,25 @@ class EtlCoreTests(unittest.TestCase):
         audit.record("INSERT_TARGET_DATA", "SUCCESS", "REPORTS", "Loaded rows")
 
         create_sql = cursor.execute.call_args_list[0].args[0]
-        insert_call = cursor.execute.call_args_list[3]
+        insert_call = cursor.execute.call_args_list[5]
         insert_sql, insert_values = insert_call.args
         self.assertIn('"DW_TEST"."UW_RAW_STG"."ETL_PIPELINE_LOG"', create_sql)
         self.assertNotIn("S_NO", create_sql)
         self.assertIn("RUN_STEP_NO NUMBER", create_sql)
         self.assertIn("ERROR_MESSAGE VARCHAR", create_sql)
+        self.assertIn("START_TIME TIMESTAMP_NTZ", create_sql)
+        self.assertIn("END_TIME TIMESTAMP_NTZ", create_sql)
         self.assertIn("TIME_STAMP TIMESTAMP_NTZ", create_sql)
         self.assertIn("DROP COLUMN IF EXISTS S_NO", cursor.execute.call_args_list[2].args[0])
         self.assertIn(
-            "(RUN_ID, RUN_STEP_NO, TABLE_NAME, STEP, STATUS, MESSAGE, ERROR_MESSAGE)",
+            "(RUN_ID, RUN_STEP_NO, TABLE_NAME, STEP, STATUS, MESSAGE,",
             insert_sql,
         )
         self.assertEqual(
-            insert_values,
+            insert_values[:7],
             (audit.run_id, 1, "REPORTS", "INSERT_TARGET_DATA", "SUCCESS", "Loaded rows", None),
         )
+        self.assertEqual(insert_values[8], "SUCCESS")
         self.assertEqual(cursor.close.call_count, 2)
 
     def test_each_audit_run_has_new_run_id_and_step_numbers_restart(self):
@@ -86,10 +89,10 @@ class EtlCoreTests(unittest.TestCase):
             )
 
         failure_values = cursor.execute.call_args_list[-1].args[1]
-        self.assertEqual(failure_values[3:5], ("EXTRACT_SOURCE_DATA", "FAILURE"))
-        self.assertIn("test step failure", failure_values[5])
-        self.assertIn("RuntimeError", failure_values[6])
-        self.assertIn("Traceback (most recent call last)", failure_values[6])
+        self.assertEqual(failure_values[:2], ("FAILED", "EXTRACT_SOURCE_DATA failed: test step failure"))
+        self.assertIn("RuntimeError", failure_values[2])
+        self.assertIn("Traceback (most recent call last)", failure_values[2])
+        self.assertEqual(failure_values[3:], (audit.run_id, 1))
 
     def test_snowflake_audit_logger_records_step_start_and_success(self):
         connection = Mock()
@@ -102,8 +105,25 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(result, "loaded")
         started_values = cursor.execute.call_args_list[0].args[1]
         success_values = cursor.execute.call_args_list[1].args[1]
-        self.assertEqual(started_values[3:5], ("LOAD_MAPPING", "STARTED"))
-        self.assertEqual(success_values[3:5], ("LOAD_MAPPING", "SUCCESS"))
+        self.assertEqual(started_values[3:5], ("LOAD_MAPPING", "RUNNING"))
+        self.assertEqual(success_values[:2], ("SUCCESS", "LOAD_MAPPING completed successfully"))
+        self.assertEqual(success_values[3:], (audit.run_id, 1))
+
+    def test_snowflake_audit_logger_marks_interrupted_steps(self):
+        connection = Mock()
+        cursor = Mock()
+        connection.cursor.return_value = cursor
+        audit = SnowflakeAuditLogger(connection, "DW_TEST", "UW_RAW_STG")
+
+        with self.assertRaises(KeyboardInterrupt):
+            audit.run_step(
+                "EXTRACT_SOURCE_DATA",
+                lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+            )
+
+        interrupted_values = cursor.execute.call_args_list[-1].args[1]
+        self.assertEqual(interrupted_values[:2], ("INTERRUPTED", "EXTRACT_SOURCE_DATA interrupted"))
+        self.assertEqual(interrupted_values[3:], (audit.run_id, 1))
 
     @patch("scripts.run_initial_etl.load_dataframe_to_snowflake", return_value=1)
     @patch("scripts.run_initial_etl.pd.read_sql", return_value=pd.DataFrame({"SOURCE_COLUMN": [1]}))
@@ -139,6 +159,7 @@ class EtlCoreTests(unittest.TestCase):
         connect_4d.return_value = fourd_connection
         audit = Mock()
         audit.run_id = "test-run-id"
+        audit.record.return_value = 1
         audit.run_step.side_effect = lambda step, action, table_name=None: action()
         audit_logger.return_value = audit
 
@@ -147,11 +168,66 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(result["tables"][0]["rows_loaded"], 1)
         records = [call.args for call in audit.record.call_args_list]
         pipeline_records = [record for record in records if record[0] == "ETL_PIPELINE"]
-        self.assertEqual([record[1] for record in pipeline_records], ["STARTED", "SUCCESS"])
+        self.assertEqual([record[1] for record in pipeline_records], ["RUNNING"])
         self.assertIn("test-run-id", pipeline_records[0][3])
-        self.assertIn("Loaded 1 rows into REPORTS", pipeline_records[1][3])
+        audit.finish_step.assert_called_once()
+        finish_values = audit.finish_step.call_args.args
+        self.assertEqual(finish_values[:2], (1, "SUCCESS"))
+        self.assertIn("Loaded 1 rows into REPORTS", finish_values[2])
         fourd_connection.close.assert_called_once()
         snowflake_cursor.close.assert_called_once()
+        snowflake_connection.close.assert_called_once()
+
+    @patch(
+        "scripts.run_initial_etl.load_metadata_from_excel",
+        side_effect=RuntimeError("mapping failed"),
+    )
+    @patch("scripts.run_initial_etl.SnowflakeAuditLogger")
+    @patch("scripts.run_initial_etl.connect_to_snowflake")
+    def test_run_for_table_marks_pipeline_failed(
+        self,
+        connect_snowflake,
+        audit_logger,
+        load_metadata,
+    ):
+        snowflake_connection = Mock()
+        connect_snowflake.return_value = snowflake_connection
+        audit = Mock()
+        audit.run_id = "test-run-id"
+        audit.record.return_value = 1
+        audit.run_step.side_effect = lambda _step, action, _table_name=None: action()
+        audit_logger.return_value = audit
+
+        with self.assertRaisesRegex(RuntimeError, "mapping failed"):
+            run_initial_etl.run_for_table("mapping.xlsx", "Reports", "REPORTS")
+
+        self.assertEqual(audit.finish_step.call_args.args[:2], (1, "FAILED"))
+        snowflake_connection.close.assert_called_once()
+
+    @patch(
+        "scripts.run_initial_etl.load_metadata_from_excel",
+        side_effect=KeyboardInterrupt(),
+    )
+    @patch("scripts.run_initial_etl.SnowflakeAuditLogger")
+    @patch("scripts.run_initial_etl.connect_to_snowflake")
+    def test_run_for_table_marks_pipeline_interrupted(
+        self,
+        connect_snowflake,
+        audit_logger,
+        load_metadata,
+    ):
+        snowflake_connection = Mock()
+        connect_snowflake.return_value = snowflake_connection
+        audit = Mock()
+        audit.run_id = "test-run-id"
+        audit.record.return_value = 1
+        audit.run_step.side_effect = lambda _step, action, _table_name=None: action()
+        audit_logger.return_value = audit
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_initial_etl.run_for_table("mapping.xlsx", "Reports", "REPORTS")
+
+        self.assertEqual(audit.finish_step.call_args.args[:2], (1, "INTERRUPTED"))
         snowflake_connection.close.assert_called_once()
 
     @patch("scripts.run_initial_etl.load_dataframe_to_snowflake", return_value=1)

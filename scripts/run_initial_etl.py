@@ -5,6 +5,7 @@ import logging
 import sys
 import traceback
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -48,6 +49,8 @@ def run_for_table(
         selected_target_names = list(target_table)
     audit_table_name = ", ".join(selected_target_names) or None
 
+    pipeline_started_at = datetime.now()
+    snowflake_connect_started_at = datetime.now()
     snowflake_conn = connect_to_snowflake()
     audit = SnowflakeAuditLogger(
         snowflake_conn,
@@ -55,26 +58,31 @@ def run_for_table(
         settings.snowflake_schema,
     )
     audit_ready = False
+    pipeline_step_number = None
     try:
+        audit_table_started_at = datetime.now()
         audit.ensure_table()
         audit_ready = True
-        audit.record(
+        pipeline_step_number = audit.record(
             "ETL_PIPELINE",
-            "STARTED",
+            "RUNNING",
             audit_table_name,
             f"ETL run {audit.run_id} started using worksheet {sheet_name}",
+            start_time=pipeline_started_at,
         )
         audit.record(
             "CONNECT_SNOWFLAKE",
             "SUCCESS",
             audit_table_name,
             "Snowflake connection established",
+            start_time=snowflake_connect_started_at,
         )
         audit.record(
             "ENSURE_AUDIT_TABLE",
             "SUCCESS",
             audit_table_name,
             "Snowflake audit table is ready",
+            start_time=audit_table_started_at,
         )
 
         if isinstance(sheet_name, dict):
@@ -223,24 +231,34 @@ def run_for_table(
                 snowflake_cursor.close,
                 audit_table_name,
             )
-        audit.record(
-            "ETL_PIPELINE",
+        audit.finish_step(
+            pipeline_step_number,
             "SUCCESS",
-            audit_table_name,
             "; ".join(
                 f"Loaded {item['rows_loaded']} rows into {item['table']}"
                 for item in summary
             ),
         )
         return {"tables": summary}
+    except KeyboardInterrupt:
+        logger.warning("ETL execution interrupted")
+        if audit_ready and pipeline_step_number is not None:
+            try:
+                audit.finish_step(
+                    pipeline_step_number,
+                    "INTERRUPTED",
+                    "ETL pipeline was interrupted by the user",
+                )
+            except Exception:
+                logger.exception("Could not store pipeline interruption in Snowflake audit table")
+        raise
     except Exception as exc:
         logger.exception("ETL execution failed")
-        if audit_ready:
+        if audit_ready and pipeline_step_number is not None:
             try:
-                audit.record(
-                    "ETL_PIPELINE",
-                    "FAILURE",
-                    audit_table_name,
+                audit.finish_step(
+                    pipeline_step_number,
+                    "FAILED",
                     f"ETL pipeline failed: {exc}",
                     traceback.format_exc(),
                 )
