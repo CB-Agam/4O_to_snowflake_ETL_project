@@ -39,7 +39,13 @@ def table_metadata_from_dataframe(df: pd.DataFrame) -> Dict[str, List[Dict[str, 
         "source datatype",
         "source data type",
     )
-    target_table_name = _pick_column_name(columns, "target table", "target_table", "Target table")
+    target_table_name = _pick_column_name(
+        columns,
+        "target table",
+        "target_table",
+        "Target table",
+        "Traget table",
+    )
     target_column_name = _pick_column_name(columns, "target column", "target_column", "Target column")
     snowflake_datatype_name = _pick_column_name(
         columns,

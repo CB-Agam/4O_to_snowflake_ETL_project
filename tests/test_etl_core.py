@@ -163,7 +163,12 @@ class EtlCoreTests(unittest.TestCase):
         audit.run_step.side_effect = lambda step, action, table_name=None: action()
         audit_logger.return_value = audit
 
-        result = run_initial_etl.run_for_table("mapping.xlsx", "Reports", "REPORTS")
+        with (
+            patch("scripts.run_initial_etl.acquire_table_run_lock", return_value={}),
+            patch("scripts.run_initial_etl.renew_table_run_lock"),
+            patch("scripts.run_initial_etl.release_table_run_lock"),
+        ):
+            result = run_initial_etl.run_for_table("mapping.xlsx", "Reports", "REPORTS")
 
         self.assertEqual(result["tables"][0]["rows_loaded"], 1)
         records = [call.args for call in audit.record.call_args_list]
@@ -270,15 +275,20 @@ class EtlCoreTests(unittest.TestCase):
         audit.run_step.side_effect = lambda _step, action, _table_name=None: action()
         audit_logger.return_value = audit
 
-        result = run_initial_etl.run_for_table(
-            "mapping.xlsx",
-            {
-                "ACCOUNTS_AGING_ITEM": "Accounts Aging Item",
-                "REPORTS": "Reports",
-                "ACCOUNT_CONTACTS": "Account Contacts",
-            },
-            ["ACCOUNTS_AGING_ITEM", "Reports", "Account_Contacts"],
-        )
+        with (
+            patch("scripts.run_initial_etl.acquire_table_run_lock", return_value={}),
+            patch("scripts.run_initial_etl.renew_table_run_lock"),
+            patch("scripts.run_initial_etl.release_table_run_lock"),
+        ):
+            result = run_initial_etl.run_for_table(
+                "mapping.xlsx",
+                {
+                    "ACCOUNTS_AGING_ITEM": "Accounts Aging Item",
+                    "REPORTS": "Reports",
+                    "ACCOUNT_CONTACTS": "Account Contacts",
+                },
+                ["ACCOUNTS_AGING_ITEM", "Reports", "Account_Contacts"],
+            )
 
         self.assertEqual(
             [item["table"] for item in result["tables"]],
@@ -456,6 +466,23 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(metadata["ACC_CHEQUE_PAYMENTS"][0]["target_column"], "CHEQUE_ID_NO")
         self.assertEqual(metadata["ACC_CHEQUE_PAYMENTS"][0]["source_data_type"], "INT32")
 
+    def test_table_metadata_accepts_existing_workbook_target_table_header_typo(self):
+        df = pd.DataFrame([
+            {
+                "Source table": "Vehicle Table",
+                "Source column": "Make",
+                "Traget table": "VEHICLE_TABLE",
+                "Target Column": "MAKE",
+                "4D Data Type": "CLOB",
+                "Snowflake Data Type": "VARCHAR(250)",
+            },
+        ])
+
+        metadata = table_metadata_from_dataframe(df)
+
+        self.assertEqual(metadata["VEHICLE_TABLE"][0]["source_table"], "Vehicle Table")
+        self.assertEqual(metadata["VEHICLE_TABLE"][0]["target_column"], "MAKE")
+
     def test_clob_columns_use_unbounded_varchar_for_create_and_existing_tables(self):
         rows = [
             {
@@ -572,15 +599,50 @@ class EtlCoreTests(unittest.TestCase):
         create_sql = build_create_table_sql("REPORTS", rows, schema_name="UW_RAW_STG")
         repair_sql = build_timestamp_column_sql("REPORTS", rows, schema_name="UW_RAW_STG")
 
-        self.assertIn("CREATED_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() NOT NULL", create_sql)
-        self.assertIn("UPDATED_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP() NOT NULL", create_sql)
+        self.assertIn(
+            "CREATED_TIMESTAMP TIMESTAMP_NTZ "
+            "DEFAULT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ NOT NULL",
+            create_sql,
+        )
+        self.assertIn(
+            "UPDATED_TIMESTAMP TIMESTAMP_NTZ "
+            "DEFAULT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ NOT NULL",
+            create_sql,
+        )
         self.assertEqual(len(repair_sql), 2)
         self.assertIn(
-            "UPDATE UW_RAW_STG.REPORTS SET CREATED_TIMESTAMP = CURRENT_TIMESTAMP() "
-            "WHERE CREATED_TIMESTAMP IS NULL",
+            "UPDATE UW_RAW_STG.REPORTS SET CREATED_TIMESTAMP = "
+            "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ WHERE CREATED_TIMESTAMP IS NULL",
             repair_sql,
         )
         self.assertTrue(all("ALTER COLUMN" not in statement for statement in repair_sql))
+
+    def test_create_table_uses_timestamp_type_for_managed_columns_regardless_of_mapping_type(self):
+        rows = [
+            {
+                "target_column": "CREATED_TIMESTAMP",
+                "snowflake_datatype": "VARCHAR",
+                "constraint": "",
+            },
+            {
+                "target_column": "UPDATED_TIMESTAMP",
+                "snowflake_datatype": "VARCHAR",
+                "constraint": "",
+            },
+        ]
+
+        create_sql = build_create_table_sql("VEHICLE_TABLE", rows, schema_name="UW_RAW_STG")
+
+        self.assertIn(
+            "CREATED_TIMESTAMP TIMESTAMP_NTZ "
+            "DEFAULT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ NOT NULL",
+            create_sql,
+        )
+        self.assertIn(
+            "UPDATED_TIMESTAMP TIMESTAMP_NTZ "
+            "DEFAULT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ NOT NULL",
+            create_sql,
+        )
 
     def test_insert_sets_both_managed_timestamps_in_snowflake(self):
         sql = build_insert_sql("REPORTS", ["REPORT_NAME"], schema_name="UW_RAW_STG")
@@ -589,7 +651,8 @@ class EtlCoreTests(unittest.TestCase):
             sql,
             "INSERT INTO UW_RAW_STG.REPORTS "
             "(REPORT_NAME, CREATED_TIMESTAMP, UPDATED_TIMESTAMP) "
-            "VALUES (%s, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())",
+            "VALUES (%s, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, "
+            "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)",
         )
 
     def test_load_dataframe_populates_timestamps_without_python_values(self):
@@ -613,7 +676,11 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(inserted, 1)
         sql, rows = cursor.executemany.call_args.args
         self.assertIn("CREATED_TIMESTAMP, UPDATED_TIMESTAMP", sql)
-        self.assertIn("CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()", sql)
+        self.assertIn(
+            "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, "
+            "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ",
+            sql,
+        )
         self.assertEqual(rows, [("Example",)])
 
     def test_build_source_query_quotes_identifiers_and_skips_blank_columns(self):

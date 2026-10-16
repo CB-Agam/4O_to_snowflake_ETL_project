@@ -26,6 +26,12 @@ from etl.ddl import (
     build_widen_clob_columns_sql,
 )
 from etl.load import build_source_query, load_dataframe_to_snowflake, table_exists_in_snowflake
+from etl.incremental import (
+    acquire_table_run_lock,
+    incremental_load_table,
+    release_table_run_lock,
+    renew_table_run_lock,
+)
 from etl.metadata import load_metadata_from_excel
 
 
@@ -42,7 +48,11 @@ def run_for_table(
     excel_path: str,
     sheet_name: str | dict[str, str],
     target_table: str | Sequence[str] | None = None,
+    incremental: bool = False,
+    overlap_seconds: int = 86400,
 ) -> dict:
+    if incremental and overlap_seconds < 0:
+        raise ValueError("Incremental overlap seconds cannot be negative")
     if isinstance(target_table, str) or target_table is None:
         selected_target_names = [target_table] if target_table else []
     else:
@@ -120,66 +130,6 @@ def run_for_table(
 
         snowflake_cursor = audit.run_step("OPEN_SNOWFLAKE_CURSOR", snowflake_conn.cursor)
         try:
-            for table_name, rows in selected_tables.items():
-                exists = audit.run_step(
-                    "CHECK_TARGET_TABLE",
-                    lambda: table_exists_in_snowflake(
-                        snowflake_cursor,
-                        settings.snowflake_schema,
-                        table_name,
-                    ),
-                    table_name,
-                )
-                if exists:
-                    audit.record(
-                        "CREATE_TARGET_TABLE",
-                        "SKIPPED",
-                        table_name,
-                        "Target table already exists",
-                    )
-                    audit.run_step(
-                        "DROP_STATUS_COLUMN",
-                        lambda: snowflake_cursor.execute(
-                            build_drop_status_column_sql(
-                                table_name,
-                                schema_name=settings.snowflake_schema,
-                            )
-                        ),
-                        table_name,
-                    )
-                    for statement in build_widen_clob_columns_sql(
-                        table_name,
-                        rows,
-                        schema_name=settings.snowflake_schema,
-                    ):
-                        audit.run_step(
-                            "WIDEN_CLOB_COLUMN",
-                            lambda statement=statement: snowflake_cursor.execute(statement),
-                            table_name,
-                        )
-                    for statement in build_timestamp_column_sql(
-                        table_name,
-                        rows,
-                        schema_name=settings.snowflake_schema,
-                    ):
-                        audit.run_step(
-                            "ENFORCE_TIMESTAMP_COLUMN",
-                            lambda statement=statement: snowflake_cursor.execute(statement),
-                            table_name,
-                        )
-                else:
-                    audit.run_step(
-                        "CREATE_TARGET_TABLE",
-                        lambda: snowflake_cursor.execute(
-                            build_create_table_sql(
-                                table_name,
-                                rows,
-                                schema_name=settings.snowflake_schema,
-                            )
-                        ),
-                        table_name,
-                    )
-
             fourd_conn = audit.run_step("CONNECT_4D", connect_to_4d)
             try:
                 summary = []
@@ -198,31 +148,152 @@ def run_for_table(
                     source_columns = [row["source_column"] for row in source_rows]
                     target_columns = [row["target_column"] for row in source_rows]
 
-                    query = build_source_query(source_table, source_columns)
-                    df = audit.run_step(
-                        "EXTRACT_SOURCE_DATA",
-                        lambda: pd.read_sql(query, fourd_conn),
-                        table_name,
-                    )
-                    df.columns = target_columns
-                    inserted = audit.run_step(
-                        "INSERT_TARGET_DATA",
-                        lambda: load_dataframe_to_snowflake(
+                    table_lock = audit.run_step(
+                        "ACQUIRE_TABLE_LOCK",
+                        lambda: acquire_table_run_lock(
                             snowflake_cursor,
+                            snowflake_conn,
+                            settings.snowflake_database,
+                            settings.snowflake_schema,
                             table_name,
-                            target_columns,
-                            df,
-                            schema_name=settings.snowflake_schema,
+                            rows,
                         ),
                         table_name,
                     )
-                    summary.append({
-                        "table": table_name,
-                        "source_table": source_table,
-                        "source_columns": source_columns,
-                        "target_columns": target_columns,
-                        "rows_loaded": inserted,
-                    })
+                    try:
+                        exists = audit.run_step(
+                            "CHECK_TARGET_TABLE",
+                            lambda: table_exists_in_snowflake(
+                                snowflake_cursor,
+                                settings.snowflake_schema,
+                                table_name,
+                            ),
+                            table_name,
+                        )
+                        if exists:
+                            audit.record(
+                                "CREATE_TARGET_TABLE",
+                                "SKIPPED",
+                                table_name,
+                                "Target table already exists",
+                            )
+                            audit.run_step(
+                                "DROP_STATUS_COLUMN",
+                                lambda: snowflake_cursor.execute(
+                                    build_drop_status_column_sql(
+                                        table_name,
+                                        schema_name=settings.snowflake_schema,
+                                    )
+                                ),
+                                table_name,
+                            )
+                            for statement in build_widen_clob_columns_sql(
+                                table_name,
+                                rows,
+                                schema_name=settings.snowflake_schema,
+                            ):
+                                audit.run_step(
+                                    "WIDEN_CLOB_COLUMN",
+                                    lambda statement=statement: snowflake_cursor.execute(statement),
+                                    table_name,
+                                )
+                            for statement in build_timestamp_column_sql(
+                                table_name,
+                                rows,
+                                schema_name=settings.snowflake_schema,
+                            ):
+                                audit.run_step(
+                                    "ENFORCE_TIMESTAMP_COLUMN",
+                                    lambda statement=statement: snowflake_cursor.execute(statement),
+                                    table_name,
+                                )
+                        else:
+                            audit.run_step(
+                                "CREATE_TARGET_TABLE",
+                                lambda: snowflake_cursor.execute(
+                                    build_create_table_sql(
+                                        table_name,
+                                        rows,
+                                        schema_name=settings.snowflake_schema,
+                                    )
+                                ),
+                                table_name,
+                            )
+
+                        if incremental:
+                            result = audit.run_step(
+                                "INCREMENTAL_LOAD",
+                                lambda: incremental_load_table(
+                                    fourd_conn,
+                                    snowflake_conn,
+                                    snowflake_cursor,
+                                    settings.snowflake_database,
+                                    settings.snowflake_schema,
+                                    table_name,
+                                    rows,
+                                    audit.run_id,
+                                    overlap_seconds=overlap_seconds,
+                                    table_lock=table_lock,
+                                ),
+                                table_name,
+                            )
+                            summary.append(
+                                {
+                                    "table": table_name,
+                                    "source_table": source_table,
+                                    "source_columns": source_columns,
+                                    "target_columns": target_columns,
+                                    **result,
+                                }
+                            )
+                            continue
+
+                        query = build_source_query(source_table, source_columns)
+                        df = audit.run_step(
+                            "EXTRACT_SOURCE_DATA",
+                            lambda: pd.read_sql(query, fourd_conn),
+                            table_name,
+                        )
+                        df.columns = target_columns
+                        audit.run_step(
+                            "RENEW_TABLE_LOCK",
+                            lambda: renew_table_run_lock(
+                                snowflake_cursor,
+                                snowflake_conn,
+                                table_lock,
+                                table_name,
+                            ),
+                            table_name,
+                        )
+                        inserted = audit.run_step(
+                            "INSERT_TARGET_DATA",
+                            lambda: load_dataframe_to_snowflake(
+                                snowflake_cursor,
+                                table_name,
+                                target_columns,
+                                df,
+                                schema_name=settings.snowflake_schema,
+                            ),
+                            table_name,
+                        )
+                        summary.append({
+                            "table": table_name,
+                            "source_table": source_table,
+                            "source_columns": source_columns,
+                            "target_columns": target_columns,
+                            "rows_loaded": inserted,
+                        })
+                    finally:
+                        audit.run_step(
+                            "RELEASE_TABLE_LOCK",
+                            lambda: release_table_run_lock(
+                                snowflake_cursor,
+                                snowflake_conn,
+                                table_lock,
+                                table_name,
+                            ),
+                            table_name,
+                        )
             finally:
                 audit.run_step("CLOSE_4D_CONNECTION", fourd_conn.close, audit_table_name)
         finally:
@@ -235,7 +306,11 @@ def run_for_table(
             pipeline_step_number,
             "SUCCESS",
             "; ".join(
-                f"Loaded {item['rows_loaded']} rows into {item['table']}"
+                (
+                    f"No changes for {item['table']}"
+                    if item.get("status") == "NO_CHANGE"
+                    else f"Loaded {item['rows_loaded']} rows into {item['table']}"
+                )
                 for item in summary
             ),
         )
@@ -270,7 +345,7 @@ def run_for_table(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create missing Snowflake tables from the Excel mapping and load data from 4D.")
+    parser = argparse.ArgumentParser(description="Load 4D source tables into Snowflake.")
     parser.add_argument("--excel", default=str(DEFAULT_EXCEL_PATH), help="Path to the Excel mapping workbook")
     parser.add_argument(
         "--sheet",
@@ -290,7 +365,28 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Multiple target table names to load in one run.",
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Maintain a current change-batch table and append prior current rows to a _H history table.",
+    )
+    parser.add_argument(
+        "--overlap-seconds",
+        type=_non_negative_seconds,
+        default=86400,
+        help="Re-read rows modified within this overlap window to catch timestamp ties (default: 86400).",
+    )
     return parser.parse_args(argv)
+
+
+def _non_negative_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("overlap seconds must be an integer") from exc
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("overlap seconds cannot be negative")
+    return seconds
 
 
 def _find_mapping_sheet(excel_path: str, target_table: str) -> str:
@@ -340,12 +436,24 @@ def main() -> int:
             table_name or "all mapped tables",
             sheet_name,
         )
-        result = run_for_table(args.excel, sheet_name, selected_tables)
-        for item in result["tables"]:
-            message = (
-                f"Loaded {item['rows_loaded']} rows into {item['table']} "
-                f"from {item['source_table']}"
+        if args.incremental or args.overlap_seconds != 86400:
+            result = run_for_table(
+                args.excel,
+                sheet_name,
+                selected_tables,
+                incremental=args.incremental,
+                overlap_seconds=args.overlap_seconds,
             )
+        else:
+            result = run_for_table(args.excel, sheet_name, selected_tables)
+        for item in result["tables"]:
+            if item.get("status") == "NO_CHANGE":
+                message = f"No changes detected for {item['table']}"
+            else:
+                message = (
+                    f"Loaded {item['rows_loaded']} changed rows into {item['table']} "
+                    f"from {item['source_table']}"
+                )
             logger.info(message)
             print(message)
 

@@ -2,6 +2,16 @@
 
 This project loads mapped data directly from 4D into Snowflake using the Excel workbook as mapping metadata.
 
+## Documentation
+
+See [Raw-layer extraction from 4D to Snowflake](docs/RAW_LAYER_4D_TO_SNOWFLAKE.md)
+for the end-to-end extraction and load flow, connection configuration, target
+table preparation, current `ETL_PIPELINE_LOG` behavior, and the proposed
+`PIPELINE_RUN_LOG` parent/child design for UW and EIS.
+
+The illustrated Microsoft Word version is available at
+[RAW_LAYER_4D_TO_SNOWFLAKE.docx](docs/RAW_LAYER_4D_TO_SNOWFLAKE.docx).
+
 ## Project structure
 
 - config/
@@ -44,6 +54,15 @@ py -3.12 scripts\run_initial_etl.py --tables ACCOUNTS_AGING_ITEM Reports Account
 The runner selects the worksheet matching the target table name. You can pass
 `--sheet "Worksheet Name"` if the worksheet uses a different name. The ETL
 inserts rows; check the Snowflake targets before rerunning to avoid duplicates.
+
+Incremental mode is opt-in and maintains a current change-batch table plus an
+append-only `_H` history table. Review [incremental loading documentation](docs/INCREMENTAL_LOADING.md)
+and confirm the configured Snowflake schema is a development target before the
+first run:
+
+```powershell
+py -3.12 scripts\run_initial_etl.py --table CLAIMS --incremental
+```
 
 Pipeline output is shown in the console and saved to `logs/etl_pipeline.log`.
 Errors include full tracebacks; the log rotates at 5 MB and keeps up to five

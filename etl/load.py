@@ -7,6 +7,7 @@ import pandas as pd
 from etl.ddl import build_create_table_sql
 
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
+_CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
 
 
 def get_table_rows(metadata: Dict[str, List[Dict[str, str]]], table_name: str) -> List[Dict[str, str]]:
@@ -38,7 +39,7 @@ def build_insert_sql(table_name: str, target_columns: Sequence[str], schema_name
     if schema_name:
         qualified_name = f"{schema_name}.{table_name}"
     columns_sql = ", ".join(inserted_columns)
-    values = ["%s"] * len(source_columns) + ["CURRENT_TIMESTAMP()"] * len(_ETL_TIMESTAMP_COLUMNS)
+    values = ["%s"] * len(source_columns) + [_CURRENT_TIMESTAMP_NTZ] * len(_ETL_TIMESTAMP_COLUMNS)
     placeholders = ", ".join(values)
     return f"INSERT INTO {qualified_name} ({columns_sql}) VALUES ({placeholders})"
 

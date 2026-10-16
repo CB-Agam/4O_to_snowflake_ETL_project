@@ -6,6 +6,8 @@ from typing import Dict, List
 
 _BOUNDED_VARCHAR = re.compile(r"^VARCHAR\s*\(\s*\d+\s*\)$", re.IGNORECASE)
 _ETL_TIMESTAMP_COLUMNS = {"CREATED_TIMESTAMP", "UPDATED_TIMESTAMP"}
+_ETL_TIMESTAMP_TYPE = "TIMESTAMP_NTZ"
+_CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
 
 
 def is_primary_key(value: str | None) -> bool:
@@ -34,13 +36,14 @@ def build_create_table_sql(table_name: str, rows: List[Dict[str, str]], schema_n
 
     for row in rows:
         column_name = row.get("target_column")
-        data_type = _snowflake_column_type(row)
         if not column_name:
             continue
 
+        is_etl_timestamp = column_name.strip().upper() in _ETL_TIMESTAMP_COLUMNS
+        data_type = _ETL_TIMESTAMP_TYPE if is_etl_timestamp else _snowflake_column_type(row)
         definition = f"{column_name} {data_type}"
-        if column_name.strip().upper() in _ETL_TIMESTAMP_COLUMNS:
-            definition = f"{definition} DEFAULT CURRENT_TIMESTAMP() NOT NULL"
+        if is_etl_timestamp:
+            definition = f"{definition} DEFAULT {_CURRENT_TIMESTAMP_NTZ} NOT NULL"
         if is_primary_key(row.get("constraint")) and len(pk_columns) == 1:
             definition = f"{definition} PRIMARY KEY"
         column_definitions.append(definition)
@@ -103,7 +106,8 @@ def build_timestamp_column_sql(
     for column_name in timestamp_columns:
         statements.append(
             f"UPDATE {qualified_name} "
-            f"SET {column_name} = CURRENT_TIMESTAMP() WHERE {column_name} IS NULL"
+            f"SET {column_name} = {_CURRENT_TIMESTAMP_NTZ} "
+            f"WHERE {column_name} IS NULL"
         )
     return statements
 
