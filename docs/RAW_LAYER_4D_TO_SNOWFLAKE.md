@@ -136,7 +136,11 @@ for the selected tables in the run.
 **Code operation:** The runner opens the cursor and calls
 `connect_to_4d()` in `connections/fourd_connection.py`. 4D is connected with
 `pyodbc`, using either the configured DSN or driver/server/port settings.
-`FOURD_QUERY_TIMEOUT_SECONDS` defaults to 1,800 seconds.
+`FOURD_QUERY_TIMEOUT_SECONDS` defaults to 1,800 seconds. Set it to `0` to
+disable the client-side query timeout; the ODBC driver or 4D server may still
+impose its own limits. Snowflake's `SNOWFLAKE_NETWORK_TIMEOUT_SECONDS` defaults
+to `0`, which disables the connector's client-side request timeout. A positive
+value enables it. Negative values for either setting are rejected.
 
 **Output and next step:** Both data connections are ready for table-level
 processing.
@@ -194,24 +198,31 @@ replacement.
 **Purpose and input:** Retrieve only the fields defined by the mapping.
 
 **Code operation:** `build_source_query()` in `etl/load.py` builds a quoted
-4D `SELECT`; `pandas.read_sql()` executes it through the ODBC connection.
-Returned columns are renamed to target names in the DataFrame.
+4D `SELECT`; the ODBC cursor streams rows with `fetchmany()` in chunks of
+`--batch-size` rows (default 50,000) for full mode. Each chunk is serialized
+to a temporary JSON file and staged in Snowflake.
 
-**Output and next step:** The complete selected result is held in memory and
-passed to the chosen load mode.
+**Output and next step:** Full mode keeps only one source chunk in memory at a
+time and stages it before publishing the complete load. Incremental mode
+continues to use its own change-detection strategy.
 
 **Failure handling and logging:** Query or conversion failures are recorded in
-the `EXTRACT_SOURCE_DATA` step for full mode or `INCREMENTAL_LOAD` step for
+the `BATCHED_BULK_LOAD` step for full mode or `INCREMENTAL_LOAD` step for
 incremental mode, then raised. There is no partial-success response.
 
 ### 9. Load rows in the default full mode
 
-**Purpose and input:** Insert the extracted DataFrame into the Snowflake raw
+**Purpose and input:** Bulk-load the mapped source rows into the Snowflake raw
 table when `--incremental` was not specified.
 
-**Code operation:** `load_dataframe_to_snowflake()` in `etl/load.py` inserts
-the mapped rows using `executemany`. It supplies current Snowflake timestamps
-for the managed `CREATED_TIMESTAMP` and `UPDATED_TIMESTAMP` fields.
+**Code operation:** `load_query_to_snowflake_in_batches()` in `etl/load.py`
+creates a session-scoped staging table. It uses Snowflake Connector
+uploads each JSON file with `PUT` and loads each chunk into a temporary
+Snowflake staging table with `COPY INTO`. This avoids a Parquet/PyArrow
+dependency. The loader verifies each chunk and the total staged row count,
+then inserts from the staging table into the target in one DML transaction.
+Current Snowflake timestamps are assigned to `CREATED_TIMESTAMP` and
+`UPDATED_TIMESTAMP` during publication.
 
 **Output and next step:** The run summary includes the inserted row count;
 cleanup and final status follow.
@@ -220,9 +231,10 @@ cleanup and final status follow.
 existing target. Re-running it inserts the source rows again. It is therefore
 not an idempotent replacement process.
 
-**Failure handling and logging:** An insertion error is recorded as a failed
-`INSERT_TARGET_DATA` step and re-raised. Full mode does not place the data
-insert and target preparation into one all-or-nothing transaction.
+**Failure handling and logging:** Extraction or staging errors are recorded
+as a failed `BATCHED_BULK_LOAD` step. Until every chunk is staged and verified,
+the target is unchanged. If the final insert fails, its DML transaction is
+rolled back; the error is raised and the temporary stage is cleaned up.
 
 ### 10. Load changed batches in opt-in incremental mode
 

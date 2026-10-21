@@ -12,12 +12,15 @@ def connect_to_snowflake():
     missing = settings.missing_snowflake_settings()
     if missing:
         raise ValueError(f"Missing Snowflake environment variables: {', '.join(missing)}")
+    network_timeout = settings.snowflake_network_timeout_seconds
+    if network_timeout < 0:
+        raise ValueError("SNOWFLAKE_NETWORK_TIMEOUT_SECONDS cannot be negative")
 
     try:
         connection = snowflake.connector.connect(
             **settings.snowflake_connection_config(),
             login_timeout=30,
-            network_timeout=60,
+            network_timeout=network_timeout or None,
         )
 
         with connection.cursor() as cursor:

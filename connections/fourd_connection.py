@@ -13,15 +13,18 @@ def connect_to_4d():
     if missing:
         raise ValueError(f"Missing 4D environment variables: {', '.join(missing)}")
 
+    query_timeout = settings.fourd_query_timeout_seconds
+    if query_timeout < 0:
+        raise ValueError("FOURD_QUERY_TIMEOUT_SECONDS cannot be negative")
+
     conn_str = settings.fourd_connection_string()
     logger.info("Attempting connection to 4D server %s:%s", settings.fourd_server, settings.fourd_port)
 
     try:
         connection = pyodbc.connect(conn_str, timeout=30)
-        if settings.fourd_query_timeout_seconds <= 0:
-            connection.close()
-            raise ValueError("FOURD_QUERY_TIMEOUT_SECONDS must be greater than zero")
-        connection.timeout = settings.fourd_query_timeout_seconds
+        connection.timeout = query_timeout
+        if query_timeout == 0:
+            logger.info("4D query timeout disabled")
         logger.info("4D connection successful")
         return connection
     except pyodbc.Error as exc:

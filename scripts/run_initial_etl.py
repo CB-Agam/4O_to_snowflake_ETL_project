@@ -25,7 +25,11 @@ from etl.ddl import (
     build_timestamp_column_sql,
     build_widen_clob_columns_sql,
 )
-from etl.load import build_source_query, load_dataframe_to_snowflake, table_exists_in_snowflake
+from etl.load import (
+    build_source_query,
+    load_query_to_snowflake_in_batches,
+    table_exists_in_snowflake,
+)
 from etl.incremental import (
     acquire_table_run_lock,
     incremental_load_table,
@@ -50,9 +54,12 @@ def run_for_table(
     target_table: str | Sequence[str] | None = None,
     incremental: bool = False,
     overlap_seconds: int = 86400,
+    batch_size: int = 50_000,
 ) -> dict:
     if incremental and overlap_seconds < 0:
         raise ValueError("Incremental overlap seconds cannot be negative")
+    if batch_size <= 0:
+        raise ValueError("Batch size must be greater than zero")
     if isinstance(target_table, str) or target_table is None:
         selected_target_names = [target_table] if target_table else []
     else:
@@ -249,30 +256,31 @@ def run_for_table(
                             continue
 
                         query = build_source_query(source_table, source_columns)
-                        df = audit.run_step(
-                            "EXTRACT_SOURCE_DATA",
-                            lambda: pd.read_sql(query, fourd_conn),
-                            table_name,
-                        )
-                        df.columns = target_columns
-                        audit.run_step(
-                            "RENEW_TABLE_LOCK",
-                            lambda: renew_table_run_lock(
-                                snowflake_cursor,
-                                snowflake_conn,
-                                table_lock,
+                        def renew_lock_before_publish() -> None:
+                            audit.run_step(
+                                "RENEW_TABLE_LOCK",
+                                lambda: renew_table_run_lock(
+                                    snowflake_cursor,
+                                    snowflake_conn,
+                                    table_lock,
+                                    table_name,
+                                ),
                                 table_name,
-                            ),
-                            table_name,
-                        )
+                            )
+
                         inserted = audit.run_step(
-                            "INSERT_TARGET_DATA",
-                            lambda: load_dataframe_to_snowflake(
+                            "BATCHED_BULK_LOAD",
+                            lambda: load_query_to_snowflake_in_batches(
+                                fourd_conn,
+                                snowflake_conn,
                                 snowflake_cursor,
+                                query,
+                                settings.snowflake_database,
+                                settings.snowflake_schema,
                                 table_name,
                                 target_columns,
-                                df,
-                                schema_name=settings.snowflake_schema,
+                                batch_size=batch_size,
+                                before_publish=renew_lock_before_publish,
                             ),
                             table_name,
                         )
@@ -366,6 +374,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Multiple target table names to load in one run.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=50_000,
+        help="Rows extracted and staged per Snowflake bulk-load batch (default: 50000).",
+    )
+    parser.add_argument(
         "--incremental",
         action="store_true",
         help="Maintain a current change-batch table and append prior current rows to a _H history table.",
@@ -387,6 +401,16 @@ def _non_negative_seconds(value: str) -> int:
     if seconds < 0:
         raise argparse.ArgumentTypeError("overlap seconds cannot be negative")
     return seconds
+
+
+def _positive_int(value: str) -> int:
+    try:
+        size = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("batch size must be an integer") from exc
+    if size <= 0:
+        raise argparse.ArgumentTypeError("batch size must be greater than zero")
+    return size
 
 
 def _find_mapping_sheet(excel_path: str, target_table: str) -> str:
@@ -436,16 +460,14 @@ def main() -> int:
             table_name or "all mapped tables",
             sheet_name,
         )
-        if args.incremental or args.overlap_seconds != 86400:
-            result = run_for_table(
-                args.excel,
-                sheet_name,
-                selected_tables,
-                incremental=args.incremental,
-                overlap_seconds=args.overlap_seconds,
-            )
-        else:
-            result = run_for_table(args.excel, sheet_name, selected_tables)
+        result = run_for_table(
+            args.excel,
+            sheet_name,
+            selected_tables,
+            incremental=args.incremental,
+            overlap_seconds=args.overlap_seconds,
+            batch_size=args.batch_size,
+        )
         for item in result["tables"]:
             if item.get("status") == "NO_CHANGE":
                 message = f"No changes detected for {item['table']}"

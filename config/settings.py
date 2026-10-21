@@ -28,6 +28,9 @@ class Settings:
         self.snowflake_schema = os.getenv("SNOWFLAKE_SCHEMA", "")
         self.snowflake_role = os.getenv("SNOWFLAKE_ROLE", "")
         self.snowflake_authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR", "externalbrowser")
+        self.snowflake_network_timeout_seconds = int(
+            os.getenv("SNOWFLAKE_NETWORK_TIMEOUT_SECONDS", "0")
+        )
 
     def missing_4d_settings(self):
         required = {

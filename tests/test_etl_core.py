@@ -2,7 +2,7 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pandas as pd
 
@@ -17,7 +17,13 @@ from etl.ddl import (
 from etl.metadata import table_metadata_from_dataframe
 from config.settings import Settings
 from connections.fourd_connection import connect_to_4d
-from etl.load import build_insert_sql, build_source_query, load_dataframe_to_snowflake
+from connections.snowflake_connection import connect_to_snowflake
+from etl.load import (
+    build_insert_sql,
+    build_source_query,
+    load_dataframe_to_snowflake,
+    load_query_to_snowflake_in_batches,
+)
 from scripts import run_initial_etl
 from scripts.run_initial_etl import _parse_args
 
@@ -125,8 +131,7 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(interrupted_values[:2], ("INTERRUPTED", "EXTRACT_SOURCE_DATA interrupted"))
         self.assertEqual(interrupted_values[3:], (audit.run_id, 1))
 
-    @patch("scripts.run_initial_etl.load_dataframe_to_snowflake", return_value=1)
-    @patch("scripts.run_initial_etl.pd.read_sql", return_value=pd.DataFrame({"SOURCE_COLUMN": [1]}))
+    @patch("scripts.run_initial_etl.load_query_to_snowflake_in_batches", return_value=1)
     @patch("scripts.run_initial_etl.table_exists_in_snowflake", return_value=True)
     @patch("scripts.run_initial_etl.connect_to_4d")
     @patch(
@@ -148,8 +153,7 @@ class EtlCoreTests(unittest.TestCase):
         load_metadata,
         connect_4d,
         table_exists,
-        read_sql,
-        load_dataframe,
+        load_in_batches,
     ):
         snowflake_connection = Mock()
         snowflake_cursor = Mock()
@@ -235,8 +239,7 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(audit.finish_step.call_args.args[:2], (1, "INTERRUPTED"))
         snowflake_connection.close.assert_called_once()
 
-    @patch("scripts.run_initial_etl.load_dataframe_to_snowflake", return_value=1)
-    @patch("scripts.run_initial_etl.pd.read_sql", return_value=pd.DataFrame({"SOURCE_COLUMN": [1]}))
+    @patch("scripts.run_initial_etl.load_query_to_snowflake_in_batches", return_value=1)
     @patch("scripts.run_initial_etl.table_exists_in_snowflake", return_value=True)
     @patch("scripts.run_initial_etl.connect_to_4d")
     @patch("scripts.run_initial_etl.load_metadata_from_excel")
@@ -249,8 +252,7 @@ class EtlCoreTests(unittest.TestCase):
         load_metadata,
         connect_4d,
         table_exists,
-        read_sql,
-        load_dataframe,
+        load_in_batches,
     ):
         targets_by_sheet = {
             "Accounts Aging Item": "ACCOUNTS_AGING_ITEM",
@@ -295,8 +297,7 @@ class EtlCoreTests(unittest.TestCase):
             ["ACCOUNTS_AGING_ITEM", "REPORTS", "ACCOUNT_CONTACTS"],
         )
         self.assertEqual(load_metadata.call_count, 3)
-        self.assertEqual(read_sql.call_count, 3)
-        self.assertEqual(load_dataframe.call_count, 3)
+        self.assertEqual(load_in_batches.call_count, 3)
         status_drops = [
             call.args[0]
             for call in snowflake_cursor.execute.call_args_list
@@ -363,6 +364,9 @@ class EtlCoreTests(unittest.TestCase):
             str(run_initial_etl.DEFAULT_EXCEL_PATH),
             "Account Contacts",
             "ACCOUNT_CONTACTS",
+            incremental=False,
+            overlap_seconds=86400,
+            batch_size=50_000,
         )
 
     @patch("scripts.run_initial_etl.run_for_table", return_value={"tables": []})
@@ -396,7 +400,19 @@ class EtlCoreTests(unittest.TestCase):
                 "ACCOUNT_CONTACTS": "Account Contacts",
             },
             ["ACCOUNTS_AGING_ITEM", "Reports", "Account_Contacts"],
+            incremental=False,
+            overlap_seconds=86400,
+            batch_size=50_000,
         )
+
+    def test_cli_accepts_custom_bulk_load_batch_size(self):
+        args = _parse_args(["--table", "Alerts", "--batch-size", "2500"])
+
+        self.assertEqual(args.batch_size, 2500)
+
+    def test_cli_rejects_non_positive_bulk_load_batch_size(self):
+        with self.assertRaises(SystemExit):
+            _parse_args(["--table", "Alerts", "--batch-size", "0"])
 
     def test_drop_status_column_sql_targets_selected_table(self):
         self.assertEqual(
@@ -421,6 +437,70 @@ class EtlCoreTests(unittest.TestCase):
         connect.assert_called_once_with("DRIVER=test;", timeout=30)
         self.assertEqual(connection.timeout, 1800)
         connection.cursor.assert_not_called()
+
+    @patch("connections.fourd_connection.pyodbc.connect")
+    @patch("connections.fourd_connection.settings")
+    def test_connect_to_4d_accepts_zero_as_disabled_query_timeout(self, settings, connect):
+        settings.missing_4d_settings.return_value = []
+        settings.fourd_connection_string.return_value = "DRIVER=test;"
+        settings.fourd_server = "server"
+        settings.fourd_port = "19813"
+        settings.fourd_query_timeout_seconds = 0
+        connection = Mock()
+        connect.return_value = connection
+
+        result = connect_to_4d()
+
+        self.assertIs(result, connection)
+        self.assertEqual(connection.timeout, 0)
+
+    @patch("connections.fourd_connection.pyodbc.connect")
+    @patch("connections.fourd_connection.settings")
+    def test_connect_to_4d_rejects_negative_query_timeout(self, settings, connect):
+        settings.missing_4d_settings.return_value = []
+        settings.fourd_query_timeout_seconds = -1
+
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            connect_to_4d()
+
+        connect.assert_not_called()
+
+    @patch("connections.snowflake_connection.snowflake.connector.connect")
+    @patch("connections.snowflake_connection.settings")
+    def test_connect_to_snowflake_disables_network_timeout_by_default(
+        self, settings, connect
+    ):
+        settings.missing_snowflake_settings.return_value = []
+        settings.snowflake_network_timeout_seconds = 0
+        settings.snowflake_connection_config.return_value = {"account": "test"}
+        connection = Mock()
+        cursor = Mock()
+        connection.cursor.return_value = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect.return_value = connection
+
+        result = connect_to_snowflake()
+
+        self.assertIs(result, connection)
+        connect.assert_called_once_with(
+            account="test",
+            login_timeout=30,
+            network_timeout=None,
+        )
+        cursor.execute.assert_called_once_with("SELECT 1")
+
+    @patch("connections.snowflake_connection.snowflake.connector.connect")
+    @patch("connections.snowflake_connection.settings")
+    def test_connect_to_snowflake_rejects_negative_network_timeout(
+        self, settings, connect
+    ):
+        settings.missing_snowflake_settings.return_value = []
+        settings.snowflake_network_timeout_seconds = -1
+
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            connect_to_snowflake()
+
+        connect.assert_not_called()
 
     def test_4d_connection_string_does_not_require_database(self):
         settings = Settings()
@@ -682,6 +762,120 @@ class EtlCoreTests(unittest.TestCase):
             sql,
         )
         self.assertEqual(rows, [("Example",)])
+
+    def test_batched_load_stages_chunks_and_publishes_atomically(self):
+        source_cursor = Mock()
+        source_cursor.fetchmany.side_effect = [
+            [(1, "First"), (2, "Second")],
+            [(3, "Third")],
+            [],
+        ]
+        source_connection = Mock()
+        source_connection.cursor.return_value = source_cursor
+        snowflake_cursor = Mock()
+        snowflake_cursor.execute.return_value = snowflake_cursor
+        snowflake_cursor.fetchone.return_value = (3,)
+        connection = Mock()
+        before_publish = Mock()
+
+        def execute(sql):
+            if sql.startswith("PUT "):
+                snowflake_cursor.description = [("status",), ("message",)]
+                snowflake_cursor.fetchall.return_value = [("UPLOADED", "ok")]
+            elif sql.startswith("COPY INTO "):
+                snowflake_cursor.description = [("rows_loaded",), ("errors_seen",)]
+                snowflake_cursor.fetchall.return_value = [(2, 0)] if "_1.json" in sql else [(1, 0)]
+            return snowflake_cursor
+
+        snowflake_cursor.execute.side_effect = execute
+
+        loaded = load_query_to_snowflake_in_batches(
+            source_connection,
+            connection,
+            snowflake_cursor,
+            "SELECT ID_SOURCE, NAME_SOURCE FROM SOURCE",
+            "DW_TEST",
+            "UW_RAW_STG",
+            "TARGET",
+            ["ID", "NAME"],
+            batch_size=2,
+            before_publish=before_publish,
+        )
+
+        self.assertEqual(loaded, 3)
+        source_cursor.execute.assert_called_once_with(
+            "SELECT ID_SOURCE, NAME_SOURCE FROM SOURCE"
+        )
+        self.assertEqual(source_cursor.fetchmany.call_args_list[0].args, (2,))
+        self.assertEqual(source_cursor.fetchmany.call_count, 3)
+        self.assertTrue(source_cursor.close.called)
+        put_calls = [
+            call.args[0]
+            for call in snowflake_cursor.execute.call_args_list
+            if call.args[0].startswith("PUT ")
+        ]
+        copy_calls = [
+            call.args[0]
+            for call in snowflake_cursor.execute.call_args_list
+            if call.args[0].startswith("COPY INTO ")
+        ]
+        self.assertEqual(len(put_calls), 2)
+        self.assertEqual(len(copy_calls), 2)
+        for put_sql, copy_sql in zip(put_calls, copy_calls, strict=True):
+            staged_filename = copy_sql.split("FILES = ('", 1)[1].split("')", 1)[0]
+            self.assertIn(staged_filename, put_sql)
+        self.assertIn("CREATE TEMPORARY TABLE", snowflake_cursor.execute.call_args_list[0].args[0])
+        self.assertIn("CREATE TEMPORARY STAGE", snowflake_cursor.execute.call_args_list[1].args[0])
+        insert_call = next(
+            call.args[0]
+            for call in snowflake_cursor.execute.call_args_list
+            if call.args[0].startswith("INSERT INTO")
+        )
+        self.assertIn("CURRENT_TIMESTAMP()::TIMESTAMP_NTZ", insert_call)
+        self.assertEqual(
+            [call.args[0] for call in snowflake_cursor.execute.call_args_list].count("COMMIT"),
+            1,
+        )
+        self.assertTrue(any("DROP TABLE IF EXISTS" in call.args[0] for call in snowflake_cursor.execute.call_args_list))
+        before_publish.assert_called_once()
+        connection.rollback.assert_not_called()
+
+    def test_batched_load_failure_does_not_publish_target_rows(self):
+        source_cursor = Mock()
+        source_cursor.fetchmany.side_effect = [[(1,)], []]
+        source_connection = Mock()
+        source_connection.cursor.return_value = source_cursor
+        snowflake_cursor = Mock()
+        snowflake_cursor.execute.return_value = snowflake_cursor
+        connection = Mock()
+
+        def execute(sql):
+            if sql.startswith("PUT "):
+                snowflake_cursor.description = [("status",), ("message",)]
+                snowflake_cursor.fetchall.return_value = [("UPLOADED", "ok")]
+            elif sql.startswith("COPY INTO "):
+                snowflake_cursor.description = [("rows_loaded",), ("errors_seen",)]
+                snowflake_cursor.fetchall.return_value = [(0, 1)]
+            return snowflake_cursor
+
+        snowflake_cursor.execute.side_effect = execute
+
+        with self.assertRaisesRegex(RuntimeError, "reported 1 load error"):
+            load_query_to_snowflake_in_batches(
+                source_connection,
+                connection,
+                snowflake_cursor,
+                "SELECT ID_SOURCE FROM SOURCE",
+                "DW_TEST",
+                "UW_RAW_STG",
+                "TARGET",
+                ["ID"],
+                batch_size=1,
+            )
+
+        sql_calls = [call.args[0] for call in snowflake_cursor.execute.call_args_list]
+        self.assertFalse(any(sql.startswith("INSERT INTO") for sql in sql_calls))
+        self.assertTrue(any("DROP TABLE IF EXISTS" in sql for sql in sql_calls))
 
     def test_build_source_query_quotes_identifiers_and_skips_blank_columns(self):
         query = build_source_query(

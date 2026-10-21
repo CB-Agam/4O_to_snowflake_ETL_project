@@ -25,8 +25,11 @@ The illustrated Microsoft Word version is available at
 
 1. Copy .env.example to .env
 2. Fill in the real values for your 4D and Snowflake environment
-   - `FOURD_QUERY_TIMEOUT_SECONDS` is optional; it defaults to `1800` (30 minutes).
-     A 4D query that exceeds this limit will be cancelled by the ODBC driver.
+   - `FOURD_QUERY_TIMEOUT_SECONDS` defaults to `1800` (30 minutes). Set it to
+     `0` to disable the client-side 4D query timeout; the ODBC driver or server
+     may still impose its own limits.
+   - `SNOWFLAKE_NETWORK_TIMEOUT_SECONDS` defaults to `0` (no client-side
+     timeout for Snowflake requests). Set a positive value to enable a timeout.
 3. Install requirements:
 
 ```powershell
@@ -45,6 +48,13 @@ py -3.12 scripts\verify_connections.py
 py -3.12 scripts\run_initial_etl.py --table ACCOUNT_CONTACTS
 ```
 
+Full loads extract and stage rows in batches of 50,000 by default. Adjust the
+batch size when needed:
+
+```powershell
+py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
+```
+
 Load multiple mapped tables in one run (one Snowflake and 4D connection, with a
 single run ID in the audit log):
 
@@ -54,7 +64,8 @@ py -3.12 scripts\run_initial_etl.py --tables ACCOUNTS_AGING_ITEM Reports Account
 
 The runner selects the worksheet matching the target table name. You can pass
 `--sheet "Worksheet Name"` if the worksheet uses a different name. The ETL
-inserts rows; check the Snowflake targets before rerunning to avoid duplicates.
+appends rows to the target; check the Snowflake targets before rerunning to
+avoid duplicates.
 
 Incremental mode is opt-in and maintains a current change-batch table plus an
 append-only `_H` history table. Review [incremental loading documentation](docs/INCREMENTAL_LOADING.md)
