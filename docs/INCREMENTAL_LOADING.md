@@ -30,6 +30,51 @@ The runner uses the configured Snowflake database and schema. Verify that those
 settings point to a development schema before the first incremental run. The
 legacy full load remains the default when `--incremental` is omitted.
 
+## Synthetic `ACCOUNT_CONTACTS` Day 0 / Day 1 trial
+
+To test the requested 24-row example without changing 4D or the live
+`ACCOUNT_CONTACTS` target, save the supplied rows to
+`ACCOUNT_CONTACTS_trial.csv` in the project root. Keep the header row and all 24
+records, and save as UTF-8 CSV. The trial runner uses only this CSV; it does not
+connect to 4D.
+
+First point the Snowflake configuration to a development database/schema. The
+runner builds the trial schema from the `Account Contacts` worksheet in the
+mapping workbook, so the mapped `ACCOUNT_CONTACTS` table does not need to
+already exist. It creates isolated `ACCOUNT_CONTACTS_TRIAL` and
+`ACCOUNT_CONTACTS_TRIAL_H` tables in the configured schema.
+
+Run Day 0 once:
+
+```powershell
+py -3.12 scripts\run_account_contacts_trial.py --phase day0
+```
+
+Expected result: 23 older records in `ACCOUNT_CONTACTS_TRIAL`, no rows in
+`ACCOUNT_CONTACTS_TRIAL_H`.
+
+Then run Day 1:
+
+```powershell
+py -3.12 scripts\run_account_contacts_trial.py --phase day1
+```
+
+The unique row with the maximum `MODIFIED_ON` in the CSV is treated as the
+simulated new/updated record. Its `MODIFIED_ON` is rebased to the local time
+when the trial runs. In a single DML transaction, Day 1 copies the existing
+23 current rows into history, replaces the trial current table with that one
+latest row, and records that the phase completed. Expected result:
+`ACCOUNT_CONTACTS_TRIAL` has 1 row and `ACCOUNT_CONTACTS_TRIAL_H` has 23.
+History rows retain the current table columns and include `HISTORY_BATCH_ID`
+and `ARCHIVED_AT`. Blank fixture values in mapped numeric, boolean, date, or
+time columns are loaded as SQL `NULL`; blank text values remain empty strings.
+
+The trial runner refuses to repeat a completed phase or run Day 1 before Day 0.
+To restart, use a fresh development schema or explicitly clear only the
+`ACCOUNT_CONTACTS_TRIAL`, `ACCOUNT_CONTACTS_TRIAL_H`, and
+`ACCOUNT_CONTACTS_TRIAL_CONTROL` trial objects. Never point this test at
+production. To use a CSV elsewhere, pass `--fixture "C:\path\ACCOUNT_CONTACTS_trial.csv"`.
+
 ## Day 0: initial load
 
 For a target such as `CLAIMS`:
