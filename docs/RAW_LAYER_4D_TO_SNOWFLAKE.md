@@ -106,6 +106,11 @@ an `ETL_PIPELINE` row with status `RUNNING` and a generated `RUN_ID`.
 **Output and next step:** The audit table and parent-like run event are ready;
 mapping loading begins.
 
+**Timestamp convention:** The ETL Snowflake session uses UTC and the audit
+timestamps are stored as UTC in `TIMESTAMP_NTZ` columns. These columns do not
+retain timezone metadata; the generated CSV timing report labels its
+24-hour timestamps as UTC.
+
 **Failure handling and logging:** If Snowflake is available but audit-table
 setup fails, the run stops before extraction. Failures that happen before the
 audit table is ready can only be recorded in the local log.

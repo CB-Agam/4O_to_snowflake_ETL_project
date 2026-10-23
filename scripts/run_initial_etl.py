@@ -5,7 +5,7 @@ import logging
 import sys
 import traceback
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -59,8 +59,8 @@ def run_for_table(
         selected_target_names = list(target_table)
     audit_table_name = ", ".join(selected_target_names) or None
 
-    pipeline_started_at = datetime.now()
-    snowflake_connect_started_at = datetime.now()
+    pipeline_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    snowflake_connect_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
     snowflake_conn = connect_to_snowflake()
     audit = SnowflakeAuditLogger(
         snowflake_conn,
@@ -70,7 +70,7 @@ def run_for_table(
     audit_ready = False
     pipeline_step_number = None
     try:
-        audit_table_started_at = datetime.now()
+        audit_table_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
         audit.ensure_table()
         audit_ready = True
         pipeline_step_number = audit.record(

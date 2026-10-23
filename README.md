@@ -70,6 +70,19 @@ Errors include full tracebacks; the log rotates at 5 MB and keeps up to five
 backups. Treat logs as potentially sensitive and do not share them without
 review.
 
+Export a CSV report with one row per table and ETL run, including the table's
+current row count, the first start time, last end time, and elapsed seconds
+recorded in `ETL_PIPELINE_LOG`. The audit log table itself is excluded:
+
+```powershell
+py -3.12 scripts\export_table_load_summary.py
+```
+
+The default target is `DW_AGAM_DEV.UW_RAW_STG`; the CSV is saved under `logs/`.
+Use `--database`, `--schema`, or `--output` to override these defaults. Row
+counts are current counts at report time, so the same table count may appear
+for multiple historical runs.
+
 The ETL runner also creates and writes step-level audit records to
 `<SNOWFLAKE_DATABASE>.<SNOWFLAKE_SCHEMA>.ETL_PIPELINE_LOG`. The table contains
 a run ID, a per-run step number, table, step, status, message, full error
@@ -77,7 +90,9 @@ details, and event timestamp. Run IDs are unique per ETL invocation; order
 events within a run by `RUN_STEP_NO`. The table migration removes the former
 global `S_NO` column. The Snowflake log records steps after Snowflake is
 connected and the log table is available; earlier failures are retained in the
-local file log.
+local file log. Audit timestamps are recorded in UTC using 24-hour time.
+Because the columns use `TIMESTAMP_NTZ`, UTC is a storage convention rather
+than timezone metadata; the ETL Snowflake session is set to UTC.
 
 For mapped source columns with 4D type `CLOB`, the initial ETL widens bounded
 Snowflake `VARCHAR(n)` targets to unbounded `VARCHAR` in new table definitions
