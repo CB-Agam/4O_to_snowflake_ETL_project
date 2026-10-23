@@ -1,6 +1,7 @@
 import logging
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -19,10 +20,17 @@ from config.settings import Settings
 from connections.fourd_connection import connect_to_4d
 from etl.load import build_insert_sql, build_source_query, load_dataframe_to_snowflake
 from scripts import run_initial_etl
-from scripts.run_initial_etl import _parse_args
+from scripts.run_initial_etl import _parse_args, _utc_now_ntz
 
 
 class EtlCoreTests(unittest.TestCase):
+    def test_utc_now_ntz_returns_naive_utc_timestamp(self):
+        timestamp = _utc_now_ntz()
+
+        self.assertIsNone(timestamp.tzinfo)
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        self.assertLess(abs((timestamp - now_utc).total_seconds()), 1)
+
     def test_snowflake_audit_logger_creates_table_and_records_events(self):
         connection = Mock()
         cursor = Mock()

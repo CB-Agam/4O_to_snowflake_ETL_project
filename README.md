@@ -77,7 +77,9 @@ details, and event timestamp. Run IDs are unique per ETL invocation; order
 events within a run by `RUN_STEP_NO`. The table migration removes the former
 global `S_NO` column. The Snowflake log records steps after Snowflake is
 connected and the log table is available; earlier failures are retained in the
-local file log.
+local file log. Audit timestamps use UTC and a 24-hour output format in the
+ETL's Snowflake session. Because the columns are `TIMESTAMP_NTZ`, they do not
+store timezone metadata; UTC is the convention for values written by this ETL.
 
 For mapped source columns with 4D type `CLOB`, the initial ETL widens bounded
 Snowflake `VARCHAR(n)` targets to unbounded `VARCHAR` in new table definitions

@@ -5,7 +5,7 @@ import logging
 import sys
 import traceback
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +40,10 @@ DEFAULT_EXCEL_PATH = PROJECT_ROOT / "4D_to_Snowflake (1-50 tables mapping).xlsx"
 logger = logging.getLogger(__name__)
 
 
+def _utc_now_ntz() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def _normalize_target_table_name(value: str) -> str:
     return str(value).strip().upper().replace(" ", "_").replace("-", "_")
 
@@ -59,8 +63,8 @@ def run_for_table(
         selected_target_names = list(target_table)
     audit_table_name = ", ".join(selected_target_names) or None
 
-    pipeline_started_at = datetime.now()
-    snowflake_connect_started_at = datetime.now()
+    pipeline_started_at = _utc_now_ntz()
+    snowflake_connect_started_at = _utc_now_ntz()
     snowflake_conn = connect_to_snowflake()
     audit = SnowflakeAuditLogger(
         snowflake_conn,
@@ -70,7 +74,7 @@ def run_for_table(
     audit_ready = False
     pipeline_step_number = None
     try:
-        audit_table_started_at = datetime.now()
+        audit_table_started_at = _utc_now_ntz()
         audit.ensure_table()
         audit_ready = True
         pipeline_step_number = audit.record(

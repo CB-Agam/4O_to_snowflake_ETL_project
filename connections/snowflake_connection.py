@@ -16,6 +16,10 @@ def connect_to_snowflake():
     try:
         connection = snowflake.connector.connect(
             **settings.snowflake_connection_config(),
+            session_parameters={
+                "TIMEZONE": "UTC",
+                "TIMESTAMP_NTZ_OUTPUT_FORMAT": "YYYY-MM-DD HH24:MI:SS.FF3",
+            },
         )
 
         with connection.cursor() as cursor:
