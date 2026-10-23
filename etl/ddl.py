@@ -10,6 +10,21 @@ _ETL_TIMESTAMP_TYPE = "TIMESTAMP_NTZ"
 _CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
 
 
+def _quote_identifier(identifier: str) -> str:
+    identifier = str(identifier).strip()
+    if not identifier:
+        raise ValueError("Snowflake identifier cannot be blank")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _qualified_name(schema_name: str | None, table_name: str) -> str:
+    table_name = str(table_name).strip()
+    if not schema_name:
+        return _quote_identifier(table_name)
+    parts = [part.strip() for part in str(schema_name).split(".") if part.strip()]
+    return ".".join(_quote_identifier(part) for part in [*parts, table_name])
+
+
 def is_primary_key(value: str | None) -> bool:
     if value is None:
         return False
@@ -41,7 +56,8 @@ def build_create_table_sql(table_name: str, rows: List[Dict[str, str]], schema_n
 
         is_etl_timestamp = column_name.strip().upper() in _ETL_TIMESTAMP_COLUMNS
         data_type = _ETL_TIMESTAMP_TYPE if is_etl_timestamp else _snowflake_column_type(row)
-        definition = f"{column_name} {data_type}"
+        quoted_name = _quote_identifier(column_name)
+        definition = f"{quoted_name} {data_type}"
         if is_etl_timestamp:
             definition = f"{definition} DEFAULT {_CURRENT_TIMESTAMP_NTZ} NOT NULL"
         if is_primary_key(row.get("constraint")) and len(pk_columns) == 1:
@@ -49,12 +65,11 @@ def build_create_table_sql(table_name: str, rows: List[Dict[str, str]], schema_n
         column_definitions.append(definition)
 
     if len(pk_columns) > 1:
-        column_definitions.append(f"PRIMARY KEY ({', '.join(pk_columns)})")
+        column_definitions.append(
+            f"PRIMARY KEY ({', '.join(_quote_identifier(column) for column in pk_columns)})"
+        )
 
-    qualified_name = table_name
-    if schema_name:
-        qualified_name = f"{schema_name}.{table_name}"
-
+    qualified_name = _qualified_name(schema_name, table_name)
     return f"CREATE TABLE IF NOT EXISTS {qualified_name} (\n  {',\n  '.join(column_definitions)}\n);"
 
 
@@ -63,9 +78,7 @@ def build_widen_clob_columns_sql(
     rows: List[Dict[str, str]],
     schema_name: str | None = None,
 ) -> List[str]:
-    qualified_name = table_name
-    if schema_name:
-        qualified_name = f"{schema_name}.{table_name}"
+    qualified_name = _qualified_name(schema_name, table_name)
 
     statements = []
     for row in rows:
@@ -76,16 +89,14 @@ def build_widen_clob_columns_sql(
         ):
             statements.append(
                 f"ALTER TABLE {qualified_name} "
-                f"ALTER COLUMN {row['target_column']} SET DATA TYPE VARCHAR"
+                f"ALTER COLUMN {_quote_identifier(row['target_column'])} SET DATA TYPE VARCHAR"
             )
     return statements
 
 
 def build_drop_status_column_sql(table_name: str, schema_name: str | None = None) -> str:
-    qualified_name = table_name
-    if schema_name:
-        qualified_name = f"{schema_name}.{table_name}"
-    return f"ALTER TABLE {qualified_name} DROP COLUMN IF EXISTS STATUS"
+    qualified_name = _qualified_name(schema_name, table_name)
+    return f"ALTER TABLE {qualified_name} DROP COLUMN IF EXISTS {_quote_identifier('STATUS')}"
 
 
 def build_timestamp_column_sql(
@@ -93,9 +104,7 @@ def build_timestamp_column_sql(
     rows: List[Dict[str, str]],
     schema_name: str | None = None,
 ) -> List[str]:
-    qualified_name = table_name
-    if schema_name:
-        qualified_name = f"{schema_name}.{table_name}"
+    qualified_name = _qualified_name(schema_name, table_name)
 
     timestamp_columns = [
         row["target_column"]
@@ -104,10 +113,11 @@ def build_timestamp_column_sql(
     ]
     statements = []
     for column_name in timestamp_columns:
+        quoted_column = _quote_identifier(column_name)
         statements.append(
             f"UPDATE {qualified_name} "
-            f"SET {column_name} = {_CURRENT_TIMESTAMP_NTZ} "
-            f"WHERE {column_name} IS NULL"
+            f"SET {quoted_column} = {_CURRENT_TIMESTAMP_NTZ} "
+            f"WHERE {quoted_column} IS NULL"
         )
     return statements
 

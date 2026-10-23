@@ -16,8 +16,6 @@ def connect_to_snowflake():
     try:
         connection = snowflake.connector.connect(
             **settings.snowflake_connection_config(),
-            login_timeout=30,
-            network_timeout=60,
         )
 
         with connection.cursor() as cursor:

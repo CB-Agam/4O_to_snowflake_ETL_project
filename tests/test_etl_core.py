@@ -649,11 +649,24 @@ class EtlCoreTests(unittest.TestCase):
 
         self.assertEqual(
             sql,
-            "INSERT INTO UW_RAW_STG.REPORTS "
-            "(REPORT_NAME, CREATED_TIMESTAMP, UPDATED_TIMESTAMP) "
+            "INSERT INTO \"UW_RAW_STG\".\"REPORTS\" "
+            "(\"REPORT_NAME\", \"CREATED_TIMESTAMP\", \"UPDATED_TIMESTAMP\") "
             "VALUES (%s, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, "
             "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ)",
         )
+
+    def test_reserved_words_in_metadata_are_quoted(self):
+        sql = build_create_table_sql(
+            "MESSAGES",
+            [
+                {"target_column": "WHERE", "snowflake_datatype": "VARCHAR", "constraint": ""},
+                {"target_column": "CREATED_TIMESTAMP", "snowflake_datatype": "TIMESTAMP", "constraint": ""},
+            ],
+            schema_name="UW_RAW_STG",
+        )
+
+        self.assertIn('"WHERE" VARCHAR', sql)
+        self.assertIn('"CREATED_TIMESTAMP" TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()::TIMESTAMP_NTZ NOT NULL', sql)
 
     def test_load_dataframe_populates_timestamps_without_python_values(self):
         cursor = Mock()
@@ -682,6 +695,27 @@ class EtlCoreTests(unittest.TestCase):
             sql,
         )
         self.assertEqual(rows, [("Example",)])
+
+    def test_load_dataframe_splits_large_inserts_to_avoid_snowflake_expression_limit(self):
+        cursor = Mock()
+        columns = [f"COL_{idx}" for idx in range(30)]
+        dataframe = pd.DataFrame(
+            {
+                column: [f"value-{idx}-{col}" for idx in range(7000)]
+                for col, column in enumerate(columns)
+            }
+        )
+
+        inserted = load_dataframe_to_snowflake(
+            cursor,
+            "ALERTS",
+            columns,
+            dataframe,
+            schema_name="UW_RAW_STG",
+        )
+
+        self.assertEqual(inserted, 7000)
+        self.assertGreater(cursor.executemany.call_count, 1)
 
     def test_build_source_query_quotes_identifiers_and_skips_blank_columns(self):
         query = build_source_query(

@@ -8,6 +8,7 @@ from etl.ddl import build_create_table_sql
 
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
 _CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
+_MAX_INSERT_EXPRESSIONS = 200_000
 
 
 def get_table_rows(metadata: Dict[str, List[Dict[str, str]]], table_name: str) -> List[Dict[str, str]]:
@@ -38,7 +39,12 @@ def build_insert_sql(table_name: str, target_columns: Sequence[str], schema_name
     qualified_name = table_name
     if schema_name:
         qualified_name = f"{schema_name}.{table_name}"
-    columns_sql = ", ".join(inserted_columns)
+    quoted_name_parts = []
+    if schema_name:
+        quoted_name_parts.extend(f'"{part}"' for part in schema_name.split("."))
+    quoted_name_parts.append(f'"{table_name}"')
+    qualified_name = ".".join(quoted_name_parts)
+    columns_sql = ", ".join(f'"{column}"' for column in inserted_columns)
     values = ["%s"] * len(source_columns) + [_CURRENT_TIMESTAMP_NTZ] * len(_ETL_TIMESTAMP_COLUMNS)
     placeholders = ", ".join(values)
     return f"INSERT INTO {qualified_name} ({columns_sql}) VALUES ({placeholders})"
@@ -81,9 +87,16 @@ def load_dataframe_to_snowflake(
     if not rows:
         return 0
 
+    total_columns = len(ordered_columns) + len(_ETL_TIMESTAMP_COLUMNS)
+    max_rows_per_insert = max(1, _MAX_INSERT_EXPRESSIONS // max(total_columns, 1))
     sql = build_insert_sql(table_name, ordered_columns, schema_name=schema_name)
-    snowflake_cursor.executemany(sql, rows)
-    return len(rows)
+
+    total_written = 0
+    for start in range(0, len(rows), max_rows_per_insert):
+        chunk = rows[start : start + max_rows_per_insert]
+        snowflake_cursor.executemany(sql, chunk)
+        total_written += len(chunk)
+    return total_written
 
 
 def create_missing_tables_from_metadata(cursor, metadata: Dict[str, List[Dict[str, str]]], schema_name: str) -> List[str]:

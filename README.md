@@ -5,9 +5,10 @@ This project loads mapped data directly from 4D into Snowflake using the Excel w
 ## Documentation
 
 See [Raw-layer extraction from 4D to Snowflake](docs/RAW_LAYER_4D_TO_SNOWFLAKE.md)
-for the end-to-end extraction and load flow, connection configuration, target
-table preparation, current `ETL_PIPELINE_LOG` behavior, and the proposed
-`PIPELINE_RUN_LOG` parent/child design for UW and EIS.
+for the implemented end-to-end extraction and load flow, connection
+configuration, full and incremental modes, target-table preparation, and
+`ETL_PIPELINE_LOG` behavior. The diagram's editable vector source is
+[RAW_LAYER_DATA_FLOW.svg](docs/RAW_LAYER_DATA_FLOW.svg).
 
 The illustrated Microsoft Word version is available at
 [RAW_LAYER_4D_TO_SNOWFLAKE.docx](docs/RAW_LAYER_4D_TO_SNOWFLAKE.docx).

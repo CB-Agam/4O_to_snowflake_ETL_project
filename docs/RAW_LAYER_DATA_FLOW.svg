@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="900" viewBox="0 0 1500 900" role="img" aria-labelledby="title description">
+  <title id="title">4D to Snowflake raw-layer ETL data flow</title>
+  <desc id="description">The Python ETL Runner reads mapping metadata, queries 4D, prepares rows in memory, loads Snowflake raw tables, and directly records run and step events in ETL_PIPELINE_LOG.</desc>
+  <defs>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1,1 L11,6 L1,11 Z" fill="#1769AA"/>
+    </marker>
+    <marker id="arrow-gold" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1,1 L11,6 L1,11 Z" fill="#B77900"/>
+    </marker>
+    <marker id="arrow-orange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1,1 L11,6 L1,11 Z" fill="#C2410C"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #153B63; }
+      .subtitle { font: 400 17px Arial, sans-serif; fill: #486581; }
+      .heading { font: 700 23px Arial, sans-serif; fill: #123B63; }
+      .body { font: 400 17px Arial, sans-serif; fill: #29445F; }
+      .small { font: 400 14px Arial, sans-serif; fill: #486581; }
+      .box { stroke: #1769AA; stroke-width: 3; rx: 18; }
+      .orchestration { fill: none; stroke: #B77900; stroke-width: 3; stroke-dasharray: 10 8; marker-end: url(#arrow-gold); }
+      .data { fill: none; stroke: #1769AA; stroke-width: 4; marker-end: url(#arrow-blue); }
+      .audit { fill: none; stroke: #C2410C; stroke-width: 4; marker-end: url(#arrow-orange); }
+    </style>
+  </defs>
+
+  <rect width="1500" height="900" fill="#FFFFFF"/>
+  <text class="title" x="750" y="42" text-anchor="middle">RAW-LAYER DATA FLOW</text>
+  <text class="subtitle" x="750" y="70" text-anchor="middle">4D source extraction and Snowflake loading, as implemented in the Python ETL runner</text>
+
+  <rect class="box" x="450" y="100" width="500" height="128" fill="#EAF4FF"/>
+  <text class="heading" x="700" y="148" text-anchor="middle">Python ETL Runner</text>
+  <text class="body" x="700" y="178" text-anchor="middle">scripts/run_initial_etl.py</text>
+  <text class="small" x="700" y="203" text-anchor="middle">selects tables · coordinates connections · runs ETL steps</text>
+
+  <path class="orchestration" d="M545 228 L185 347"/>
+  <path class="orchestration" d="M635 228 L515 347"/>
+  <path class="orchestration" d="M765 228 L885 347"/>
+  <path class="orchestration" d="M855 228 L1215 347"/>
+
+  <rect class="box" x="60" y="355" width="250" height="170" fill="#F1F7FF"/>
+  <text class="heading" x="185" y="397" text-anchor="middle">Mapping workbook</text>
+  <text class="body" x="185" y="434" text-anchor="middle">Excel table and</text>
+  <text class="body" x="185" y="460" text-anchor="middle">column mappings</text>
+  <text class="small" x="185" y="495" text-anchor="middle">source / target / types / keys</text>
+
+  <rect class="box" x="390" y="355" width="250" height="170" fill="#F1F7FF"/>
+  <text class="heading" x="515" y="397" text-anchor="middle">4D source</text>
+  <text class="body" x="515" y="434" text-anchor="middle">ODBC query selects</text>
+  <text class="body" x="515" y="460" text-anchor="middle">mapped columns</text>
+  <text class="small" x="515" y="495" text-anchor="middle">read-only extraction</text>
+
+  <rect class="box" x="760" y="355" width="250" height="170" fill="#F1F7FF"/>
+  <text class="heading" x="885" y="397" text-anchor="middle">In-memory DataFrame</text>
+  <text class="body" x="885" y="434" text-anchor="middle">pandas prepares rows</text>
+  <text class="body" x="885" y="460" text-anchor="middle">and renames columns</text>
+  <text class="small" x="885" y="495" text-anchor="middle">no intermediate export file</text>
+
+  <rect class="box" x="1090" y="355" width="250" height="170" fill="#EAF7EE"/>
+  <text class="heading" x="1215" y="397" text-anchor="middle">Snowflake raw table</text>
+  <text class="body" x="1215" y="434" text-anchor="middle">target table prepared</text>
+  <text class="body" x="1215" y="460" text-anchor="middle">and rows inserted</text>
+  <text class="small" x="1215" y="495" text-anchor="middle">full-load or opt-in incremental</text>
+
+  <path class="data" d="M640 440 L750 440"/>
+  <path class="data" d="M1010 440 L1080 440"/>
+  <text class="small" x="700" y="552" text-anchor="middle">rows</text>
+  <text class="small" x="1045" y="552" text-anchor="middle">rows</text>
+
+  <path class="audit" d="M950 115 L1410 115 L1410 775 L930 775"/>
+  <text class="small" x="1390" y="620" text-anchor="end">direct audit events</text>
+  <rect class="box" x="470" y="710" width="460" height="132" fill="#FFF4E8" stroke="#C2410C"/>
+  <text class="heading" x="700" y="755" text-anchor="middle">ETL_PIPELINE_LOG</text>
+  <text class="body" x="700" y="786" text-anchor="middle">Snowflake run and step audit events</text>
+  <text class="small" x="700" y="815" text-anchor="middle">RUNNING → SUCCESS / FAILED / INTERRUPTED</text>
+
+  <line x1="60" y1="865" x2="125" y2="865" stroke="#B77900" stroke-width="3" stroke-dasharray="10 8"/>
+  <text class="small" x="137" y="870">runner orchestration / access</text>
+  <line x1="430" y1="865" x2="495" y2="865" stroke="#1769AA" stroke-width="4" marker-end="url(#arrow-blue)"/>
+  <text class="small" x="510" y="870">data movement</text>
+  <line x1="760" y1="865" x2="825" y2="865" stroke="#C2410C" stroke-width="4" marker-end="url(#arrow-orange)"/>
+  <text class="small" x="840" y="870">audit logging</text>
+</svg>
