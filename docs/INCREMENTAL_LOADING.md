@@ -30,6 +30,41 @@ The runner uses the configured Snowflake database and schema. Verify that those
 settings point to a development schema before the first incremental run. The
 legacy full load remains the default when `--incremental` is omitted.
 
+## Timestamp change detection and internal fallback
+
+The mapping workbook contains only source columns and their Snowflake target
+columns. Incremental loading does not add derived hash columns to current or
+history tables. It keeps row hashes only in its private source-state table to
+compare candidate rows when a timestamp is NULL or a timestamp strategy is not
+available.
+
+| Case | Match and comparison | Result |
+|---|---|---|
+| Day 0 | Extract every source row | Load every mapped source column into current; leave `_H` empty |
+| Key and `Modified...` timestamp available (optional `Created...`) | Scan the key plus mapped created/modified timestamps; fetch new keys, timestamp changes, overlap-window keys, and rows where either timestamp is NULL | Compare candidates with private row state; identify inserts and actual data changes |
+| One or both timestamps are NULL | Fetch the row by its declared key and compare its full-row hash with private state | Same key and different row hash is changed; same key and same row hash is unchanged |
+| New primary key | No matching key in private source state | Insert as new |
+| Key available but no usable modified timestamp | Scan the full mapped dataset and compare keyed row hashes in private state | Detect new, updated, unchanged, and deleted rows |
+| No primary key declared | Compare full-row hashes and duplicate occurrence counts in private state | Detect row changes/removals, but cannot reliably distinguish update from delete-plus-insert |
+
+When both `CREATED...` and `Modified...` source timestamp columns are mapped,
+the key scan checks both. The modified timestamp helps find updates, while the
+created timestamp helps identify timestamp changes/newly created records. Rows
+with NULL in either timestamp are fetched and checked against private row state;
+rows with both timestamps NULL are therefore still checked by their key and
+saved row hash. A
+table with a key and only `CREATED...` (but no suitable `Modified...` timestamp)
+uses the full key-hash scan so data changes are not missed. Row hashes include
+all mapped source fields, including mapped timestamp fields, but are not
+written as target columns.
+
+After Day 0, each changed run appends the previous current table to `_H`, then
+replaces current with only that run's changed rows. A no-change run leaves
+current and history untouched. Existing initialized tables whose saved
+strategy changes (for example, from `ROW_HASH` to `KEY_HASH`) must have their
+incremental state explicitly reconciled before they can use the new strategy.
+Internal row-state values are stored separately from current/history data.
+
 ## Synthetic `ACCOUNT_CONTACTS` Day 0 / Day 1 trial
 
 To test the requested 24-row example without changing 4D or the live
@@ -97,15 +132,17 @@ has no copied initial batch.
 ## Day 1 and later: changed batches
 
 For mappings with exactly one declared key and one `Modified...` timestamp
-column whose workbook type and live ODBC type are timestamp types:
+column whose workbook type and live ODBC type are timestamp types, with an
+optional mapped `Created...` timestamp:
 
-1. Read the source key and modification timestamp projection to identify new
-   keys, keys whose modification timestamp changed, and keys that disappeared.
+1. Read the source key and mapped created/modified timestamp columns to identify
+   new keys, keys whose timestamps changed, and keys that disappeared.
 2. Fetch full mapped rows only for those candidates and rows in the overlap
-   window. The default window is 24 hours; it includes records at the boundary
-   so equal-timestamp rows can be checked by row hash.
-3. Compare row hashes to the last committed per-key snapshot, then validate the
-   candidate batch.
+   window. The default window is 24 hours; it includes records at the boundary.
+   Rows with NULL created or modified timestamps are fetched and compared by
+   a private row hash on every run.
+3. Compare candidates with the last committed private per-key row-state
+   snapshot, then validate the candidate batch.
 4. In one DML transaction, append the previous current table to `_H`, delete
    current rows, insert the changed batch from staging, replace the per-table
    source snapshot, update the watermark, and mark the batch successful.
@@ -116,12 +153,13 @@ History is append-only and contains the previous current batch before each
 replacement. A retry after a failed DML transaction rolls back both the history
 append and current replacement.
 
-For a table without exactly one suitable key and modification timestamp, such
-as `Alerts` when its mapping has no unique key, the loader uses row-hash
-reconciliation. It scans and hashes the full mapped source dataset on each run,
-then stages only rows whose hash-and-occurrence identity is new. This method
-detects changed rows and row removals, including duplicate identical rows, but
-requires reading all mapped source fields each time.
+If a primary key exists but a single suitable modified timestamp does not,
+the loader scans the full mapped dataset and compares keyed row hashes in
+private state to identify new and changed records. A composite primary key uses
+this path too. If no primary key is declared, the loader instead uses full-row
+hash-and-occurrence reconciliation; this detects changed rows and removals,
+including duplicate identical rows, but cannot always distinguish an update
+from a delete plus insert.
 
 ## No-change batches
 

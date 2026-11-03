@@ -33,7 +33,7 @@ The diagram is also available as an editable vector source:
 | Component | Purpose and interaction |
 |---|---|
 | Python ETL Runner | `scripts/run_initial_etl.py` parses command-line options, reads mappings, coordinates Snowflake and 4D operations, and determines the final run result. |
-| Mapping workbook | `4D_to_Snowflake (1-50 tables mapping).xlsx` describes source tables and columns, target names and types, and mapping constraints. A selected target uses its matching worksheet; an all-table run uses the `Snowflake_table_names` worksheet. |
+| Mapping workbook | `4D_to_Snowflake mapping document.xlsx` is the default workbook and describes source tables and columns, target names and types, and mapping constraints. It contains no derived hash target columns. A selected target uses its matching worksheet; an all-table run uses the `Snowflake_table_names` worksheet. Pass `--excel` to select another workbook. |
 | 4D source | `connections/fourd_connection.py` opens an ODBC connection. The runner issues a mapped `SELECT` query against the source table. |
 | In-memory DataFrame | `pandas.read_sql` holds the extracted rows in memory. The runner renames the returned columns to Snowflake target-column names. It does not write an intermediate Excel or JSON data file. |
 | Snowflake raw table | `connections/snowflake_connection.py` opens the Snowflake connection. The runner creates or prepares the mapped target table and inserts the rows. |

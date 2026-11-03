@@ -334,6 +334,16 @@ class EtlCoreTests(unittest.TestCase):
 
         self.assertEqual(" ".join(args.table), "Accounts Aging Item")
 
+    def test_cli_defaults_to_final_mapping_workbook(self):
+        args = _parse_args([])
+
+        self.assertEqual(args.excel, str(run_initial_etl.DEFAULT_EXCEL_PATH))
+        self.assertEqual(
+            run_initial_etl.DEFAULT_EXCEL_PATH.name,
+            "4D_to_Snowflake mapping document.xlsx",
+        )
+        self.assertTrue(run_initial_etl.DEFAULT_EXCEL_PATH.is_file())
+
     def test_cli_accepts_multiple_target_tables(self):
         args = _parse_args([
             "--tables",

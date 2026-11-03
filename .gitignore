@@ -19,3 +19,5 @@ logs/
 .DS_Store
 Thumbs.db
 *.xlsx
+!4D_to_Snowflake mapping document.xlsx
+tickets_4d_export.csv

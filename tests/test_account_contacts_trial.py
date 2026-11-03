@@ -139,5 +139,6 @@ class AccountContactsTrialTests(unittest.TestCase):
         self.assertEqual(prepared.loc[0, "FULL_NAME"], "")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  
     unittest.main()
+

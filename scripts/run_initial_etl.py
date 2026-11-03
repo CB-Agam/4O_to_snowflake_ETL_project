@@ -40,7 +40,10 @@ from etl.metadata import load_metadata_from_excel
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EXCEL_PATH = PROJECT_ROOT / "4D_to_Snowflake (1-50 tables mapping).xlsx"
+DEFAULT_EXCEL_PATH = (
+    PROJECT_ROOT
+    / "4D_to_Snowflake mapping document.xlsx"
+)
 logger = logging.getLogger(__name__)
 
 

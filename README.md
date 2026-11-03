@@ -67,6 +67,12 @@ The runner selects the worksheet matching the target table name. You can pass
 appends rows to the target; check the Snowflake targets before rerunning to
 avoid duplicates.
 
+The default mapping workbook is
+`4D_to_Snowflake mapping document.xlsx`. It includes
+the source-to-target column mappings only; derived hash columns are not loaded
+into Snowflake. Use `--excel "path\to\workbook.xlsx"` to select a different
+workbook.
+
 Incremental mode is opt-in and maintains a current change-batch table plus an
 append-only `_H` history table. Review [incremental loading documentation](docs/INCREMENTAL_LOADING.md)
 and confirm the configured Snowflake schema is a development target before the

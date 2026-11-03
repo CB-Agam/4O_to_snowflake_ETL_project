@@ -43,10 +43,28 @@ def _claim_mapping() -> list[dict[str, str]]:
     ]
 
 
+def _claim_mapping_with_created_on() -> list[dict[str, str]]:
+    rows = _claim_mapping()
+    rows.insert(
+        1,
+        {
+            "source_table": "Claims",
+            "source_column": "Created On",
+            "source_data_type": "TIMESTAMP",
+            "target_table": "CLAIMS",
+            "target_column": "CREATED_ON",
+            "snowflake_datatype": "TIMESTAMP_NTZ",
+            "constraint": "",
+        },
+    )
+    return rows
+
+
 def _timestamp_metadata_cursor():
     cursor = Mock()
     cursor.columns.return_value = [
         SimpleNamespace(column_name="Claim ID", type_name="INTEGER"),
+        SimpleNamespace(column_name="Created On", type_name="TIMESTAMP"),
         SimpleNamespace(column_name="Modified On", type_name="TIMESTAMP"),
         SimpleNamespace(column_name="Amount", type_name="NUMERIC"),
     ]
@@ -102,7 +120,52 @@ class IncrementalStrategyTests(unittest.TestCase):
 
         self.assertEqual(strategy["strategy"], "KEY_TIMESTAMP")
         self.assertEqual(strategy["key_source_column"], "Claim ID")
+        self.assertIsNone(strategy["created_source_column"])
         self.assertEqual(strategy["modified_source_column"], "Modified On")
+
+    def test_created_and_modified_timestamps_are_both_selected(self):
+        strategy = incremental.select_change_strategy(_claim_mapping_with_created_on())
+
+        self.assertEqual(strategy["strategy"], "KEY_TIMESTAMP")
+        self.assertEqual(strategy["created_source_column"], "Created On")
+        self.assertEqual(strategy["modified_source_column"], "Modified On")
+
+    def test_created_timestamp_state_migration_is_only_needed_for_known_values(self):
+        created_at = datetime(2025, 1, 1)
+        old_state = {"1": ("row-hash", datetime(2025, 1, 2))}
+
+        self.assertTrue(
+            incremental._needs_created_timestamp_refresh(
+                old_state,
+                [("CLAIMS", "1", "row-hash", datetime(2025, 1, 2), created_at)],
+            )
+        )
+        self.assertFalse(
+            incremental._needs_created_timestamp_refresh(
+                old_state,
+                [("CLAIMS", "1", "row-hash", datetime(2025, 1, 2), None)],
+            )
+        )
+        self.assertFalse(
+            incremental._needs_created_timestamp_refresh(
+                {
+                    "1": (
+                        "row-hash",
+                        datetime(2025, 1, 2),
+                        created_at,
+                    )
+                },
+                [("CLAIMS", "1", "row-hash", datetime(2025, 1, 2), created_at)],
+            )
+        )
+
+    def test_created_timestamp_without_modified_uses_key_hash_full_scan(self):
+        rows = [
+            row for row in _claim_mapping_with_created_on()
+            if row["source_column"] != "Modified On"
+        ]
+
+        self.assertEqual(incremental.select_change_strategy(rows)["strategy"], "KEY_HASH")
 
     def test_unkeyed_alerts_use_full_row_hash_fallback(self):
         rows = _claim_mapping()
@@ -142,7 +205,71 @@ class IncrementalStrategyTests(unittest.TestCase):
     def test_multiple_key_columns_are_not_assumed_to_be_a_single_key(self):
         rows = _claim_mapping()
         rows[2]["constraint"] = "PK"
-        self.assertEqual(incremental.select_change_strategy(rows)["strategy"], "ROW_HASH")
+        strategy = incremental.select_change_strategy(rows)
+        self.assertEqual(strategy["strategy"], "KEY_HASH")
+        self.assertEqual(strategy["key_target_columns"], ["CLAIM_ID", "AMOUNT"])
+
+    def test_primary_key_without_modified_timestamp_uses_key_hash_strategy(self):
+        rows = [
+            row for row in _claim_mapping()
+            if row["source_column"] != "Modified On"
+        ]
+
+        strategy = incremental.select_change_strategy(rows)
+
+        self.assertEqual(strategy["strategy"], "KEY_HASH")
+        self.assertEqual(strategy["key_target_columns"], ["CLAIM_ID"])
+
+    @patch("etl.incremental.pd.read_sql")
+    def test_key_hash_fallback_distinguishes_new_updated_unchanged_and_deleted(
+        self,
+        read_sql,
+    ):
+        unchanged = (1, "same")
+        changed = (2, "old")
+        deleted = (3, "gone")
+        rows = [
+            {
+                "source_table": "Claims",
+                "source_column": "Claim ID",
+                "target_column": "CLAIM_ID",
+                "constraint": "PK",
+            },
+            {
+                "source_table": "Claims",
+                "source_column": "Amount",
+                "target_column": "AMOUNT",
+                "constraint": "",
+            },
+        ]
+        read_sql.return_value = pd.DataFrame(
+            [unchanged, (2, "new"), (4, "inserted")],
+            columns=["CLAIM_ID", "AMOUNT"],
+        )
+        old_state = {
+            incremental._row_hash((1,)): (incremental._row_hash(unchanged), None),
+            incremental._row_hash((2,)): (incremental._row_hash(changed), None),
+            incremental._row_hash((3,)): (incremental._row_hash(deleted), None),
+        }
+
+        changed_df, new_state, source_count, inserted, updated, deleted_count = (
+            incremental._discover_key_hash_changes(
+                Mock(),
+                "CLAIMS",
+                rows,
+                old_state,
+            )
+        )
+
+        self.assertEqual(changed_df.to_dict("records"), [
+            {"CLAIM_ID": 2, "AMOUNT": "new"},
+            {"CLAIM_ID": 4, "AMOUNT": "inserted"},
+        ])
+        self.assertEqual((source_count, inserted, updated, deleted_count), (3, 1, 1, 1))
+        self.assertEqual(
+            [row[1] for row in new_state],
+            [incremental._row_hash((1,)), incremental._row_hash((2,)), incremental._row_hash((4,))],
+        )
 
     def test_duplicate_declared_source_key_fails_validation(self):
         rows = _claim_mapping()
@@ -376,7 +503,55 @@ class IncrementalStrategyTests(unittest.TestCase):
 
         self.assertTrue(changed.empty)
         self.assertEqual((inserted, updated, deleted), (0, 0, 0))
-        self.assertEqual(state[0][2:], (row_hash, None))
+        self.assertEqual(state[0][2:], (row_hash, None, None))
+        self.assertEqual(read_sql.call_count, 2)
+
+    @patch("etl.incremental.pd.read_sql")
+    def test_created_change_and_both_null_timestamps_are_hash_compared(self, read_sql):
+        old_created = datetime(2025, 1, 1)
+        new_created = datetime(2025, 1, 2)
+        old_modified = datetime(2025, 1, 3)
+        rows = _claim_mapping_with_created_on()
+        old_row_hash = incremental._row_hash((1, old_created, old_modified, 10))
+        null_row_hash = incremental._row_hash((2, None, None, 20))
+        read_sql.side_effect = [
+            pd.DataFrame(
+                {
+                    "Claim ID": [1, 2],
+                    "Created On": [new_created, None],
+                    "Modified On": [old_modified, None],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "CLAIM_ID": [1, 2],
+                    "CREATED_ON": [new_created, None],
+                    "MODIFIED_ON": [old_modified, None],
+                    "AMOUNT": [10, 20],
+                }
+            ),
+        ]
+        fourd = Mock()
+        fourd.cursor.return_value = _timestamp_metadata_cursor()
+
+        changed, state, _, inserted, updated, deleted = (
+            incremental._discover_timestamp_changes(
+                fourd,
+                "CLAIMS",
+                rows,
+                {
+                    "1": (old_row_hash, old_modified, old_created),
+                    "2": (null_row_hash, None, None),
+                },
+                datetime(2025, 1, 3),
+                0,
+            )
+        )
+
+        self.assertEqual(changed["CLAIM_ID"].tolist(), [1])
+        self.assertEqual((inserted, updated, deleted), (0, 1, 0))
+        self.assertEqual(state[0][4], new_created)
+        self.assertEqual(state[1][2], null_row_hash)
         self.assertEqual(read_sql.call_count, 2)
 
     def test_source_extraction_failure_is_not_treated_as_no_change(self):
@@ -465,8 +640,12 @@ class IncrementalTransactionTests(unittest.TestCase):
                 "AMOUNT": [10, 20],
             }
         )
+        mapped_rows = _claim_mapping()
         with contextlib.ExitStack() as stack:
             self._patch_initial_dependencies(stack)
+            stage_loader = stack.enter_context(
+                patch.object(incremental, "load_dataframe_to_snowflake")
+            )
             stack.enter_context(patch("etl.incremental.pd.read_sql", return_value=initial))
             result = incremental.incremental_load_table(
                 Mock(),
@@ -475,15 +654,27 @@ class IncrementalTransactionTests(unittest.TestCase):
                 "DW_TEST",
                 "RAW_TEST",
                 "CLAIMS",
-                _claim_mapping(),
+                mapped_rows,
                 "run-1",
             )
 
         self.assertEqual(result["rows_loaded"], 2)
         self.assertEqual(result["status"], "SUCCESS")
+        loaded_columns = stage_loader.call_args.args[2]
+        loaded_frame = stage_loader.call_args.args[3]
+        self.assertEqual(loaded_columns, ["CLAIM_ID", "MODIFIED_ON", "AMOUNT"])
+        self.assertEqual(
+            list(loaded_frame.columns),
+            ["CLAIM_ID", "MODIFIED_ON", "AMOUNT"],
+        )
         sql_calls = [call.args[0] for call in cursor.execute.call_args_list]
-        self.assertFalse(any("INSERT INTO" in sql and "_H" in sql for sql in sql_calls))
+        self.assertFalse(
+            any("INSERT INTO" in sql and '"CLAIMS_H"' in sql for sql in sql_calls)
+        )
         self.assertIn("CREATE TEMPORARY TABLE", "\n".join(sql_calls))
+        self.assertFalse(
+            any("ADD COLUMN IF NOT EXISTS" in sql for sql in sql_calls)
+        )
 
     def test_no_change_batch_keeps_current_history_and_watermark_unchanged(self):
         import contextlib
@@ -519,10 +710,15 @@ class IncrementalTransactionTests(unittest.TestCase):
             stack.enter_context(patch.object(incremental, "_start_batch"))
             finish = stack.enter_context(patch.object(incremental, "_finish_batch"))
             release = stack.enter_context(patch.object(incremental, "_release_lock"))
+            replace_state = stack.enter_context(
+                patch.object(incremental, "_replace_row_state")
+            )
             stack.enter_context(patch.object(incremental, "_validate_timestamp_metadata"))
             stack.enter_context(patch.object(incremental, "_discover_timestamp_changes", return_value=(
-                pd.DataFrame(columns=["CLAIM_ID", "MODIFIED_ON", "AMOUNT"]),
-                [("CLAIMS", "1", old_hash, timestamp)],
+                pd.DataFrame(
+                    columns=["CLAIM_ID", "CREATED_ON", "MODIFIED_ON", "AMOUNT"]
+                ),
+                [("CLAIMS", "1", old_hash, timestamp, datetime(2023, 1, 1))],
                 1,
                 0,
                 0,
@@ -531,7 +727,14 @@ class IncrementalTransactionTests(unittest.TestCase):
             stage_loader = stack.enter_context(patch.object(incremental, "load_dataframe_to_snowflake"))
 
             result = incremental.incremental_load_table(
-                Mock(), connection, cursor, "DW_TEST", "RAW_TEST", "CLAIMS", _claim_mapping(), "run-2"
+                Mock(),
+                connection,
+                cursor,
+                "DW_TEST",
+                "RAW_TEST",
+                "CLAIMS",
+                _claim_mapping_with_created_on(),
+                "run-2",
             )
 
         self.assertEqual(result["status"], "NO_CHANGE")
@@ -540,6 +743,12 @@ class IncrementalTransactionTests(unittest.TestCase):
         finish.assert_called_once()
         self.assertEqual(finish.call_args.args[3], "SUCCESS")
         self.assertEqual(finish.call_args.kwargs["change_status"], "NO_CHANGE")
+        replace_state.assert_called_once_with(
+            cursor,
+            "ROW_STATE",
+            "CLAIMS",
+            [("CLAIMS", "1", old_hash, timestamp, datetime(2023, 1, 1))],
+        )
         release.assert_called_once()
         self.assertFalse(any("DELETE FROM" in call.args[0] for call in cursor.execute.call_args_list))
 

@@ -21,7 +21,10 @@ from etl.metadata import load_metadata_from_excel
 
 logger = logging.getLogger(__name__)
 SOURCE_TABLE = "ACCOUNT_CONTACTS"
-MAPPING_WORKBOOK = PROJECT_ROOT / "4D_to_Snowflake (1-50 tables mapping).xlsx"
+MAPPING_WORKBOOK = (
+    PROJECT_ROOT
+    / "4D_to_Snowflake mapping document.xlsx"
+)
 MAPPING_SHEET = "Account Contacts"
 TRIAL_TABLE = "ACCOUNT_CONTACTS_TRIAL"
 HISTORY_TABLE = f"{TRIAL_TABLE}_H"

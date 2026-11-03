@@ -80,34 +80,77 @@ def _primary_key_columns(rows: Sequence[dict[str, str]]) -> list[dict[str, str]]
     ]
 
 
-def _modified_timestamp_columns(rows: Sequence[dict[str, str]]) -> list[dict[str, str]]:
-    return [
-        row
-        for row in rows
-        if "modified" in row.get("source_column", "").casefold()
-        and row.get("source_data_type", "").strip().upper().split("(", 1)[0]
-        in _TIMESTAMP_TYPE_NAMES
-        and row.get("source_table", "").strip()
-        and row.get("source_column", "").strip()
-    ]
+def _change_timestamp_columns(
+    rows: Sequence[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    created = []
+    modified = []
+    for row in rows:
+        source_column = row.get("source_column", "").strip()
+        source_type = row.get("source_data_type", "").strip().upper().split("(", 1)[0]
+        if (
+            not row.get("source_table", "").strip()
+            or not source_column
+            or not row.get("target_column", "").strip()
+            or source_type not in _TIMESTAMP_TYPE_NAMES
+        ):
+            continue
+        normalized_name = source_column.casefold()
+        if "created" in normalized_name:
+            created.append(row)
+        if "modified" in normalized_name:
+            modified.append(row)
+    return created, modified
+
+
+def _valid_change_timestamp_columns(
+    rows: Sequence[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    created, modified = _change_timestamp_columns(rows)
+    if len(created) > 1 or len(modified) != 1:
+        return [], []
+    return created, modified
 
 
 def select_change_strategy(rows: Sequence[dict[str, str]]) -> dict[str, Any]:
     """Choose timestamp/key mode only when the workbook identifies both unambiguously."""
     keys = _primary_key_columns(rows)
-    modified = _modified_timestamp_columns(rows)
+    created, modified = _valid_change_timestamp_columns(rows)
     if len(keys) == 1 and len(modified) == 1:
         return {
             "strategy": "KEY_TIMESTAMP",
             "key_source_column": keys[0]["source_column"].strip(),
             "key_target_column": keys[0]["target_column"].strip(),
+            "key_target_columns": [keys[0]["target_column"].strip()],
+            "created_source_column": (
+                created[0]["source_column"].strip() if created else None
+            ),
+            "created_target_column": (
+                created[0]["target_column"].strip() if created else None
+            ),
             "modified_source_column": modified[0]["source_column"].strip(),
             "modified_target_column": modified[0]["target_column"].strip(),
+        }
+    if keys:
+        return {
+            "strategy": "KEY_HASH",
+            "key_source_column": None,
+            "key_target_column": None,
+            "key_target_columns": [
+                row["target_column"].strip() for row in keys
+            ],
+            "created_source_column": None,
+            "created_target_column": None,
+            "modified_source_column": None,
+            "modified_target_column": None,
         }
     return {
         "strategy": "ROW_HASH",
         "key_source_column": None,
         "key_target_column": None,
+        "key_target_columns": [],
+        "created_source_column": None,
+        "created_target_column": None,
         "modified_source_column": None,
         "modified_target_column": None,
     }
@@ -151,6 +194,12 @@ def _row_hash(values: Sequence[Any]) -> str:
     return hashlib.sha256(_canonical_json(list(values)).encode("utf-8")).hexdigest()
 
 
+def _natural_key_hash(values: Sequence[Any]) -> str:
+    for value in values:
+        _source_key(value)
+    return _row_hash(values)
+
+
 def _source_key(value: Any) -> str:
     if value is None or pd.isna(value):
         raise ValueError("A declared 4D primary key contains a NULL value")
@@ -186,11 +235,12 @@ def _rows_as_state(
     table_name: str,
     target_columns: Sequence[str],
     strategy: dict[str, Any],
-) -> list[tuple[str, str, str | None, datetime | None]]:
-    state: list[tuple[str, str, str | None, datetime | None]] = []
+) -> list[tuple[str, str, str | None, datetime | None, datetime | None]]:
+    state: list[tuple[str, str, str | None, datetime | None, datetime | None]] = []
     if strategy["strategy"] == "KEY_TIMESTAMP":
         key_column = strategy["key_target_column"]
         timestamp_column = strategy["modified_target_column"]
+        created_column = strategy["created_target_column"]
         keys: set[str] = set()
         for record in dataframe.itertuples(index=False, name=None):
             values = dict(zip(target_columns, record, strict=True))
@@ -204,7 +254,27 @@ def _rows_as_state(
                 values[timestamp_column],
                 timestamp_column,
             )
-            state.append((table_name, key, _row_hash(record), modified_at))
+            created_at = (
+                _normalize_optional_timestamp(values[created_column], created_column)
+                if created_column
+                else None
+            )
+            state.append((table_name, key, _row_hash(record), modified_at, created_at))
+        return state
+
+    if strategy["strategy"] == "KEY_HASH":
+        key_columns = strategy["key_target_columns"]
+        keys: set[str] = set()
+        for record in dataframe.itertuples(index=False, name=None):
+            values = dict(zip(target_columns, record, strict=True))
+            key = _natural_key_hash(tuple(values[column] for column in key_columns))
+            if key in keys:
+                raise ValueError(
+                    f"Declared key columns {key_columns!r} are not unique "
+                    f"in source table {table_name}"
+                )
+            keys.add(key)
+            state.append((table_name, key, _row_hash(record), None, None))
         return state
 
     occurrence_counts: Counter[str] = Counter()
@@ -217,18 +287,60 @@ def _rows_as_state(
                 f"{row_hash}:{occurrence_counts[row_hash]}",
                 row_hash,
                 None,
+                None,
             )
         )
     return state
 
 
 def _timestamp_watermark(
-    state_rows: Sequence[tuple[str, str, str | None, datetime | None]],
+    state_rows: Sequence[
+        tuple[str, str, str | None, datetime | None]
+        | tuple[str, str, str | None, datetime | None, datetime | None]
+    ],
 ) -> datetime | None:
     return max(
-        (row[3] for row in state_rows if row[3] is not None),
+        (
+            timestamp
+            for row in state_rows
+            for timestamp in row[3:]
+            if timestamp is not None
+        ),
         default=None,
     )
+
+
+def _saved_timestamps(
+    state_value: tuple[str | None, datetime | None]
+    | tuple[str | None, datetime | None, datetime | None],
+) -> tuple[str | None, datetime | None, datetime | None]:
+    if len(state_value) == 2:
+        row_hash, modified_at = state_value
+        return row_hash, modified_at, None
+    row_hash, modified_at, created_at = state_value
+    return row_hash, modified_at, created_at
+
+
+def _needs_created_timestamp_refresh(
+    old_state: dict[
+        str,
+        tuple[str | None, datetime | None]
+        | tuple[str | None, datetime | None, datetime | None],
+    ],
+    new_state: Sequence[
+        tuple[str, str, str | None, datetime | None]
+        | tuple[str, str, str | None, datetime | None, datetime | None]
+    ],
+) -> bool:
+    for row in new_state:
+        if len(row) == 5:
+            _, source_key, _, _, created_at = row
+            old_created = _saved_timestamps(
+                old_state.get(source_key, (None, None))
+            )[2]
+            if old_created is None and created_at is not None:
+                return True
+    return False
 
 
 def _validate_timestamp_metadata(
@@ -301,12 +413,16 @@ def _discover_timestamp_changes(
     fourd_connection,
     table_name: str,
     rows: Sequence[dict[str, str]],
-    state_by_key: dict[str, tuple[str | None, datetime | None]],
+    state_by_key: dict[
+        str,
+        tuple[str | None, datetime | None]
+        | tuple[str | None, datetime | None, datetime | None],
+    ],
     watermark: datetime | None,
     overlap_seconds: int,
 ) -> tuple[
     pd.DataFrame,
-    list[tuple[str, str, str | None, datetime | None]],
+    list[tuple[str, str, str | None, datetime | None, datetime | None]],
     int,
     int,
     int,
@@ -332,29 +448,63 @@ def _discover_timestamp_changes(
         raise ValueError(f"Duplicate source-column mappings for {table_name}")
     key_source = strategy["key_source_column"]
     key_target = strategy["key_target_column"]
+    created_source = strategy["created_source_column"]
+    created_target = strategy["created_target_column"]
     modified_source = strategy["modified_source_column"]
     modified_target = strategy["modified_target_column"]
-    if key_source not in source_columns or modified_source not in source_columns:
-        raise ValueError("Key and modification timestamp must be included in the source mapping")
+    required_scan_columns = [
+        key_source,
+        *([created_source] if created_source else []),
+        modified_source,
+    ]
+    if any(column not in source_columns for column in required_scan_columns):
+        raise ValueError(
+            "Key and created/modified timestamps must be included in the source mapping"
+        )
 
-    _validate_timestamp_metadata(fourd_connection, source_table, key_source, modified_source)
-    scan_query = build_source_query(source_table, [key_source, modified_source])
+    for timestamp_column in filter(None, (created_source, modified_source)):
+        _validate_timestamp_metadata(
+            fourd_connection,
+            source_table,
+            key_source,
+            timestamp_column,
+        )
+    scan_query = build_source_query(source_table, required_scan_columns)
     scan_df = pd.read_sql(scan_query, fourd_connection)
-    if len(scan_df.columns) != 2:
-        raise ValueError(f"4D key/timestamp scan returned unexpected columns for {source_table}")
+    if len(scan_df.columns) != len(required_scan_columns):
+        raise ValueError(
+            f"4D key/timestamp scan returned unexpected columns for {source_table}"
+        )
 
     source_key_values = scan_df.iloc[:, 0].tolist()
-    source_timestamps = scan_df.iloc[:, 1].tolist()
-    keyed_timestamps: dict[str, tuple[Any, datetime | None]] = {}
-    for raw_key, raw_timestamp in zip(source_key_values, source_timestamps, strict=True):
+    timestamp_values = [
+        scan_df.iloc[:, column_index].tolist()
+        for column_index in range(1, len(required_scan_columns))
+    ]
+    keyed_timestamps: dict[
+        str,
+        tuple[Any, datetime | None, datetime | None],
+    ] = {}
+    for row_index, raw_key in enumerate(source_key_values):
         key = _source_key(raw_key)
         if key in keyed_timestamps:
             raise ValueError(
                 f"Declared 4D key {key_source!r} is not unique in source table {source_table}"
             )
+        if created_source:
+            created_raw = timestamp_values[0][row_index]
+            modified_raw = timestamp_values[1][row_index]
+        else:
+            created_raw = None
+            modified_raw = timestamp_values[0][row_index]
         keyed_timestamps[key] = (
             raw_key,
-            _normalize_optional_timestamp(raw_timestamp, modified_source),
+            _normalize_optional_timestamp(modified_raw, modified_source),
+            (
+                _normalize_optional_timestamp(created_raw, created_source)
+                if created_source
+                else None
+            ),
         )
 
     threshold = (
@@ -363,13 +513,21 @@ def _discover_timestamp_changes(
         else None
     )
     keys_to_fetch = []
-    for key, (raw_key, modified_at) in keyed_timestamps.items():
-        old_hash, old_modified = state_by_key.get(key, (None, None))
-        is_new_or_changed_timestamp = old_modified is None or modified_at != old_modified
+    for key, (raw_key, modified_at, created_at) in keyed_timestamps.items():
+        old_hash, old_modified, old_created = _saved_timestamps(
+            state_by_key.get(key, (None, None))
+        )
+        is_new_or_changed_timestamp = (
+            old_hash is None
+            or modified_at != old_modified
+            or created_at != old_created
+        )
+        timestamps = [modified_at]
+        if created_source:
+            timestamps.append(created_at)
         is_in_overlap = (
             threshold is None
-            or modified_at is None
-            or modified_at >= threshold
+            or any(timestamp is None or timestamp >= threshold for timestamp in timestamps)
         )
         if is_new_or_changed_timestamp or is_in_overlap:
             keys_to_fetch.append(raw_key)
@@ -383,7 +541,7 @@ def _discover_timestamp_changes(
         key_target,
         target_columns,
     )
-    changed_by_key: dict[str, tuple[str, datetime | None]] = {}
+    changed_by_key: dict[str, tuple[str, datetime | None, datetime | None]] = {}
     changed_keys: set[str] = set()
     updated_count = 0
     inserted_count = 0
@@ -394,24 +552,36 @@ def _discover_timestamp_changes(
             values[modified_target],
             modified_target,
         )
+        source_created = (
+            _normalize_optional_timestamp(values[created_target], created_target)
+            if created_target
+            else None
+        )
         row_hash = _row_hash(record)
-        old_hash, old_modified = state_by_key.get(key, (None, None))
-        if old_hash != row_hash or old_modified != source_modified:
+        old_hash, _, _ = _saved_timestamps(state_by_key.get(key, (None, None)))
+        if (
+            old_hash != row_hash
+        ):
             changed_keys.add(key)
             if old_hash is None:
                 inserted_count += 1
             else:
                 updated_count += 1
-        changed_by_key[key] = (row_hash, source_modified)
+        changed_by_key[key] = (row_hash, source_modified, source_created)
 
     # Preserve hashes for unchanged source keys; only candidate rows need full-row reads.
     new_state = []
-    for key, (_, modified_at) in keyed_timestamps.items():
-        old_hash, old_modified = state_by_key.get(key, (None, None))
-        new_hash = changed_by_key.get(key, (old_hash, modified_at))[0]
+    for key, (_, modified_at, created_at) in keyed_timestamps.items():
+        old_hash, old_modified, old_created = _saved_timestamps(
+            state_by_key.get(key, (None, None))
+        )
+        new_hash, _, _ = changed_by_key.get(
+            key,
+            (old_hash, modified_at, created_at),
+        )
         if new_hash is None:
             raise RuntimeError(f"Missing saved row hash for unchanged key in {table_name}")
-        new_state.append((table_name, key, new_hash, modified_at))
+        new_state.append((table_name, key, new_hash, modified_at, created_at))
 
     if changed_rows.empty:
         changed_rows = pd.DataFrame(columns=target_columns)
@@ -436,7 +606,12 @@ def _discover_hash_changes(
     table_name: str,
     rows: Sequence[dict[str, str]],
     old_state: dict[str, tuple[str | None, datetime | None]],
-) -> tuple[pd.DataFrame, list[tuple[str, str, str | None, datetime | None]], int, int]:
+) -> tuple[
+    pd.DataFrame,
+    list[tuple[str, str, str | None, datetime | None, datetime | None]],
+    int,
+    int,
+]:
     source_rows = [
         row for row in rows
         if row.get("source_table", "").strip()
@@ -464,12 +639,92 @@ def _discover_hash_changes(
         row_hash = _row_hash(record)
         occurrence_counts[row_hash] += 1
         state_key = f"{row_hash}:{occurrence_counts[row_hash]}"
-        new_state.append((table_name, state_key, row_hash, None))
+        new_state.append((table_name, state_key, row_hash, None, None))
         if state_key not in old_state:
             changed_indexes.append(index)
     changed_df = full_df.iloc[changed_indexes].reset_index(drop=True)
     deleted_count = len(set(old_state) - {item[1] for item in new_state})
     return changed_df, new_state, len(full_df), deleted_count
+
+
+def _discover_key_hash_changes(
+    fourd_connection,
+    table_name: str,
+    rows: Sequence[dict[str, str]],
+    old_state: dict[str, tuple[str | None, datetime | None]],
+) -> tuple[
+    pd.DataFrame,
+    list[tuple[str, str, str | None, datetime | None, datetime | None]],
+    int,
+    int,
+    int,
+    int,
+]:
+    source_rows = [
+        row for row in rows
+        if row.get("source_table", "").strip()
+        and row.get("source_column", "").strip()
+        and row.get("target_column", "").strip()
+    ]
+    source_tables = {row["source_table"].strip() for row in source_rows}
+    if not source_rows or len(source_tables) != 1:
+        raise ValueError(f"Target {table_name} must map to exactly one 4D source table")
+
+    source_columns = list(dict.fromkeys(row["source_column"].strip() for row in source_rows))
+    target_columns = [row["target_column"].strip() for row in source_rows]
+    key_target_columns = [
+        row["target_column"].strip()
+        for row in _primary_key_columns(source_rows)
+        if row.get("target_column", "").strip()
+    ]
+    if not key_target_columns:
+        raise ValueError(f"Key-hash strategy for {table_name} requires a declared primary key")
+
+    source_table = next(iter(source_tables))
+    full_df = pd.read_sql(
+        _source_projection_query(source_table, source_columns),
+        fourd_connection,
+    )
+    if len(full_df.columns) != len(target_columns):
+        raise ValueError(f"4D extraction returned unexpected columns for {source_table}")
+    full_df.columns = target_columns
+
+    keyed_rows: set[str] = set()
+    changed_indexes: list[int] = []
+    new_state: list[tuple[str, str, str | None, datetime | None, datetime | None]] = []
+    inserted_count = 0
+    updated_count = 0
+    for index, record in enumerate(full_df.itertuples(index=False, name=None)):
+        values = dict(zip(target_columns, record, strict=True))
+        nk_hash = _natural_key_hash(
+            tuple(values[column] for column in key_target_columns)
+        )
+        if nk_hash in keyed_rows:
+            raise ValueError(
+                f"Declared primary key columns {key_target_columns!r} are not unique "
+                f"in source table {source_table}"
+            )
+        hash_diff = _row_hash(record)
+        keyed_rows.add(nk_hash)
+        new_state.append((table_name, nk_hash, hash_diff, None, None))
+        old_hash = old_state.get(nk_hash, (None, None))[0]
+        if old_hash != hash_diff:
+            changed_indexes.append(index)
+            if old_hash is None:
+                inserted_count += 1
+            else:
+                updated_count += 1
+
+    changed_df = full_df.iloc[changed_indexes].reset_index(drop=True)
+    deleted_count = len(set(old_state) - keyed_rows)
+    return (
+        changed_df,
+        new_state,
+        len(full_df),
+        inserted_count,
+        updated_count,
+        deleted_count,
+    )
 
 
 def _ensure_helper_tables(cursor, database: str, schema: str) -> dict[str, str]:
@@ -482,9 +737,13 @@ def _ensure_helper_tables(cursor, database: str, schema: str) -> dict[str, str]:
             TABLE_NAME VARCHAR(255) NOT NULL,
             SOURCE_KEY VARCHAR NOT NULL,
             ROW_HASH VARCHAR(64) NOT NULL,
-            SOURCE_MODIFIED_AT TIMESTAMP_NTZ
+            SOURCE_MODIFIED_AT TIMESTAMP_NTZ,
+            SOURCE_CREATED_AT TIMESTAMP_NTZ
         )
         """
+    )
+    cursor.execute(
+        f"ALTER TABLE {row_state} ADD COLUMN IF NOT EXISTS SOURCE_CREATED_AT TIMESTAMP_NTZ"
     )
     cursor.execute(
         f"""
@@ -557,20 +816,24 @@ def _read_table_state(cursor, state_table: str, table_name: str) -> dict[str, An
     }
 
 
-def _read_row_state(cursor, row_state_table: str, table_name: str) -> dict[str, tuple[str, datetime | None]]:
+def _read_row_state(
+    cursor,
+    row_state_table: str,
+    table_name: str,
+) -> dict[str, tuple[str, datetime | None, datetime | None]]:
     rows = cursor.execute(
         f"""
-        SELECT SOURCE_KEY, ROW_HASH, SOURCE_MODIFIED_AT
+        SELECT SOURCE_KEY, ROW_HASH, SOURCE_MODIFIED_AT, SOURCE_CREATED_AT
         FROM {row_state_table}
         WHERE TABLE_NAME = %s
         """,
         (table_name,),
     ).fetchall()
-    result: dict[str, tuple[str, datetime | None]] = {}
-    for key, row_hash, modified_at in rows:
+    result: dict[str, tuple[str, datetime | None, datetime | None]] = {}
+    for key, row_hash, modified_at, created_at in rows:
         if key in result:
             raise RuntimeError(f"Duplicate saved source state for {table_name}")
-        result[str(key)] = (str(row_hash), modified_at)
+        result[str(key)] = (str(row_hash), modified_at, created_at)
     return result
 
 
@@ -725,16 +988,28 @@ def _finish_batch(
     )
 
 
-def _replace_row_state(cursor, row_state_table: str, table_name: str, rows: Sequence[tuple[str, str, str | None, datetime | None]]) -> None:
+def _replace_row_state(
+    cursor,
+    row_state_table: str,
+    table_name: str,
+    rows: Sequence[
+        tuple[str, str, str | None, datetime | None]
+        | tuple[str, str, str | None, datetime | None, datetime | None]
+    ],
+) -> None:
     cursor.execute(f"DELETE FROM {row_state_table} WHERE TABLE_NAME = %s", (table_name,))
     if rows:
+        normalized_rows = [
+            (*row, None) if len(row) == 4 else row
+            for row in rows
+        ]
         cursor.executemany(
             f"""
             INSERT INTO {row_state_table}
-                (TABLE_NAME, SOURCE_KEY, ROW_HASH, SOURCE_MODIFIED_AT)
-            VALUES (%s, %s, %s, %s)
+                (TABLE_NAME, SOURCE_KEY, ROW_HASH, SOURCE_MODIFIED_AT, SOURCE_CREATED_AT)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            rows,
+            normalized_rows,
         )
 
 
@@ -791,6 +1066,12 @@ def incremental_load_table(
     old_watermark: datetime | None = None
     paths: dict[str, str] = {}
     stage_table = _qualified_name(database, schema, f"ETL_STAGE_{batch_id.replace('-', '')[:24].upper()}")
+    stage_column_names = {column.casefold() for column in source_target_columns}
+    stage_target_columns = [
+        column
+        for column in table_columns
+        if column.casefold() in stage_column_names
+    ]
 
     try:
         if not snowflake_cursor.execute(
@@ -878,7 +1159,7 @@ def incremental_load_table(
             counts["source_scan"] = len(initial_df)
             counts["extracted"] = len(initial_df)
             counts["changed"] = len(initial_df)
-            if strategy["strategy"] == "KEY_TIMESTAMP":
+            if strategy["strategy"] in {"KEY_TIMESTAMP", "KEY_HASH"}:
                 counts["inserted"] = len(initial_df)
                 counts["updated"] = 0
             new_watermark = _timestamp_watermark(new_state)
@@ -904,6 +1185,28 @@ def incremental_load_table(
                 (row[3] for row in new_state if row[3] is not None),
                 default=old_watermark,
             )
+            is_initial_load = False
+        elif strategy["strategy"] == "KEY_HASH":
+            (
+                changed_df,
+                new_state,
+                source_count,
+                inserted_count,
+                updated_count,
+                deleted_count,
+            ) = _discover_key_hash_changes(
+                fourd_connection,
+                table_name,
+                metadata_rows,
+                old_state,
+            )
+            counts["source_scan"] = source_count
+            counts["extracted"] = source_count
+            counts["changed"] = len(changed_df)
+            counts["inserted"] = inserted_count
+            counts["updated"] = updated_count
+            counts["deleted"] = deleted_count
+            new_watermark = old_watermark
             is_initial_load = False
         else:
             changed_df, new_state, source_count, deleted_count = _discover_hash_changes(
@@ -932,6 +1235,13 @@ def incremental_load_table(
         else:
             is_changed = bool(counts["changed"] or counts["deleted"])
         if not is_changed:
+            if _needs_created_timestamp_refresh(old_state, new_state):
+                _replace_row_state(
+                    snowflake_cursor,
+                    paths["row_state"],
+                    table_name,
+                    new_state,
+                )
             _finish_batch(
                 snowflake_cursor,
                 paths["batch_log"],
@@ -959,7 +1269,7 @@ def incremental_load_table(
         load_dataframe_to_snowflake(
             snowflake_cursor,
             f"ETL_STAGE_{batch_id.replace('-', '')[:24].upper()}",
-            source_target_columns,
+            stage_target_columns,
             changed_df,
             schema_name=f"{_quote_identifier(database)}.{_quote_identifier(schema)}",
         )
