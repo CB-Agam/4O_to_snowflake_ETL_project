@@ -7,6 +7,7 @@ import math
 import re
 import time
 from collections import Counter
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Sequence
@@ -16,20 +17,16 @@ import pandas as pd
 
 from etl.exception_log import SnowflakeExceptionLogger
 from etl.load import (
+    _log_row_failure,
+    iter_source_batches_with_row_isolation,
     load_dataframe_to_snowflake,
     load_dataframe_to_snowflake_with_exceptions,
+    source_primary_key_column,
 )
 
 logger = logging.getLogger(__name__)
 
 _TIMESTAMP_TYPE_NAMES = {"TIMESTAMP", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "DATETIME"}
-_TEMPORAL_SOURCE_TYPE_NAMES = {
-    "DATE",
-    "DATETIME",
-    "DATETIME2",
-    "TIME",
-    "TIMESTAMP",
-}
 _BATCH_LOG_NAME = "ETL_INCREMENTAL_BATCH_LOG"
 _STATE_NAME = "ETL_INCREMENTAL_TABLE_STATE"
 _ROW_STATE_NAME = "ETL_SOURCE_ROW_STATE"
@@ -83,7 +80,12 @@ def _primary_key_columns(rows: Sequence[dict[str, str]]) -> list[dict[str, str]]
     return [
         row
         for row in rows
-        if re.search(
+        if not re.search(
+            r"\b(?:NO|NONE|NOT|WITHOUT)\s+(?:A\s+)?(?:PK|PRIMARY\s+KEY)\b",
+            row.get("constraint", ""),
+            re.I,
+        )
+        and re.search(
             r"(^|[^A-Za-z0-9])(?:PK|PRIMARY\s+KEY)([^A-Za-z0-9]|$)",
             row.get("constraint", ""),
             re.I,
@@ -245,27 +247,13 @@ def _normalize_optional_timestamp(value: Any, key: str) -> datetime | None:
 def _source_projection_query(
     source_table: str,
     columns: Sequence[str],
-    metadata_rows: Sequence[dict[str, str]] = (),
 ) -> str:
-    source_types = {
-        row.get("source_column", "").strip().casefold():
-        row.get("source_data_type", "").strip().upper().split("(", 1)[0]
-        for row in metadata_rows
-    }
-
     def quote_identifier(identifier: str) -> str:
         return "[" + identifier.replace("]", "]]") + "]"
 
     projection = []
     for column in columns:
-        quoted_column = quote_identifier(column)
-        source_type = source_types.get(column.casefold(), "")
-        if source_type in _TEMPORAL_SOURCE_TYPE_NAMES:
-            projection.append(
-                f"CAST({quoted_column} AS VARCHAR(100)) AS {quoted_column}"
-            )
-        else:
-            projection.append(quoted_column)
+        projection.append(quote_identifier(column))
     if not projection:
         raise ValueError(f"No source columns provided for table: {source_table}")
     return (
@@ -429,21 +417,36 @@ def _fetch_full_rows_for_keys(
     key_target_column: str,
     target_columns: Sequence[str],
     metadata_rows: Sequence[dict[str, str]],
+    on_row_failure: Callable[[int, dict[str, Any], Exception], None] | None = None,
 ) -> pd.DataFrame:
     if not keys:
         return pd.DataFrame(columns=target_columns)
-    source_query = _source_projection_query(
-        source_table,
-        source_columns,
-        metadata_rows,
-    )
+    source_query = _source_projection_query(source_table, source_columns)
     chunks: list[pd.DataFrame] = []
     for start in range(0, len(keys), _KEY_FETCH_SIZE):
         key_chunk = keys[start : start + _KEY_FETCH_SIZE]
         query = source_query + " WHERE " + " OR ".join(
             f"[{key_column.replace(']', ']]')}] = ?" for _ in key_chunk
         )
-        chunk = pd.read_sql(query, fourd_connection, params=list(key_chunk))
+        if on_row_failure is None:
+            chunk = pd.read_sql(query, fourd_connection, params=list(key_chunk))
+        else:
+            chunk_records = []
+            for batch in iter_source_batches_with_row_isolation(
+                fourd_connection,
+                query,
+                source_table=source_table,
+                source_columns=source_columns,
+                target_columns=target_columns,
+                metadata_rows=metadata_rows,
+                key_column=key_column,
+                batch_size=_KEY_FETCH_SIZE,
+                on_row_failure=on_row_failure,
+                recovery_keys=key_chunk,
+                query_params=key_chunk,
+            ):
+                chunk_records.extend(batch)
+            chunk = pd.DataFrame(chunk_records, columns=source_columns)
         if not chunk.empty:
             chunk.columns = target_columns
             chunks.append(chunk)
@@ -469,6 +472,7 @@ def _discover_timestamp_changes(
     ],
     watermark: datetime | None,
     overlap_seconds: int,
+    on_row_failure: Callable[[int, dict[str, Any], Exception], None] | None = None,
 ) -> tuple[
     pd.DataFrame,
     list[tuple[str, str, str | None, datetime | None, datetime | None]],
@@ -518,12 +522,37 @@ def _discover_timestamp_changes(
             key_source,
             timestamp_column,
         )
-    scan_query = _source_projection_query(
-        source_table,
-        required_scan_columns,
-        source_rows,
-    )
-    scan_df = pd.read_sql(scan_query, fourd_connection)
+    scan_query = _source_projection_query(source_table, required_scan_columns)
+    scan_failed_keys: dict[str, Any] = {}
+
+    def handle_scan_failure(
+        row_number: int,
+        record: dict[str, Any],
+        error: Exception,
+    ) -> None:
+        raw_key = record.get(key_target)
+        if raw_key is not None:
+            scan_failed_keys[_source_key(raw_key)] = raw_key
+        if on_row_failure is not None:
+            on_row_failure(row_number, record, error)
+
+    if on_row_failure is None:
+        scan_df = pd.read_sql(scan_query, fourd_connection)
+    else:
+        scan_records = []
+        for batch in iter_source_batches_with_row_isolation(
+            fourd_connection,
+            scan_query,
+            source_table=source_table,
+            source_columns=required_scan_columns,
+            target_columns=required_scan_columns,
+            metadata_rows=source_rows,
+            key_column=key_source,
+            batch_size=_KEY_FETCH_SIZE,
+            on_row_failure=handle_scan_failure,
+        ):
+            scan_records.extend(batch)
+        scan_df = pd.DataFrame(scan_records, columns=required_scan_columns)
     if len(scan_df.columns) != len(required_scan_columns):
         raise ValueError(
             f"4D key/timestamp scan returned unexpected columns for {source_table}"
@@ -559,6 +588,10 @@ def _discover_timestamp_changes(
                 else None
             ),
         )
+    for key, raw_key in scan_failed_keys.items():
+        if key in state_by_key and key not in keyed_timestamps:
+            _, old_modified, old_created = _saved_timestamps(state_by_key[key])
+            keyed_timestamps[key] = (raw_key, old_modified, old_created)
 
     threshold = (
         watermark - timedelta(seconds=overlap_seconds)
@@ -594,6 +627,7 @@ def _discover_timestamp_changes(
         key_target,
         target_columns,
         rows,
+        on_row_failure=on_row_failure,
     )
     changed_by_key: dict[str, tuple[str, datetime | None, datetime | None]] = {}
     changed_keys: set[str] = set()
@@ -633,7 +667,11 @@ def _discover_timestamp_changes(
             key,
             (old_hash, modified_at, created_at),
         )
+        if key in scan_failed_keys and old_hash is not None:
+            new_hash = old_hash
         if new_hash is None:
+            if old_hash is None:
+                continue
             raise RuntimeError(f"Missing saved row hash for unchanged key in {table_name}")
         new_state.append((table_name, key, new_hash, modified_at, created_at))
 
@@ -648,7 +686,8 @@ def _discover_timestamp_changes(
     return (
         changed_rows,
         new_state,
-        len(keyed_timestamps),
+        len(keyed_timestamps)
+        + sum(key not in keyed_timestamps for key in scan_failed_keys),
         inserted_count,
         updated_count,
         deleted_count,
@@ -680,7 +719,7 @@ def _discover_hash_changes(
     source_table = next(iter(source_tables))
     source_columns = list(dict.fromkeys(row["source_column"].strip() for row in source_rows))
     target_columns = [row["target_column"].strip() for row in source_rows]
-    source_query = _source_projection_query(source_table, source_columns, rows)
+    source_query = _source_projection_query(source_table, source_columns)
     full_df = pd.read_sql(source_query, fourd_connection)
     if len(full_df.columns) != len(target_columns):
         raise ValueError(f"4D extraction returned unexpected columns for {source_table}")
@@ -706,6 +745,7 @@ def _discover_key_hash_changes(
     table_name: str,
     rows: Sequence[dict[str, str]],
     old_state: dict[str, tuple[str | None, datetime | None]],
+    on_row_failure: Callable[[int, dict[str, Any], Exception], None] | None = None,
 ) -> tuple[
     pd.DataFrame,
     list[tuple[str, str, str | None, datetime | None, datetime | None]],
@@ -735,10 +775,42 @@ def _discover_key_hash_changes(
         raise ValueError(f"Key-hash strategy for {table_name} requires a declared primary key")
 
     source_table = next(iter(source_tables))
-    full_df = pd.read_sql(
-        _source_projection_query(source_table, source_columns, rows),
-        fourd_connection,
-    )
+    source_query = _source_projection_query(source_table, source_columns)
+    failed_key_hashes: set[str] = set()
+    if on_row_failure is not None and len(key_target_columns) == 1:
+        key_target = key_target_columns[0]
+        key_source = next(
+            row["source_column"].strip()
+            for row in source_rows
+            if row["target_column"].strip() == key_target
+        )
+
+        def remember_failed_key(
+            row_number: int,
+            record: dict[str, Any],
+            error: Exception,
+        ) -> None:
+            key_value = record.get(key_target)
+            if key_value is not None:
+                failed_key_hashes.add(_natural_key_hash((key_value,)))
+            on_row_failure(row_number, record, error)
+
+        records = []
+        for batch in iter_source_batches_with_row_isolation(
+            fourd_connection,
+            source_query,
+            source_table=source_table,
+            source_columns=source_columns,
+            target_columns=target_columns,
+            metadata_rows=source_rows,
+            key_column=key_source,
+            batch_size=_KEY_FETCH_SIZE,
+            on_row_failure=remember_failed_key,
+        ):
+            records.extend(batch)
+        full_df = pd.DataFrame(records, columns=source_columns)
+    else:
+        full_df = pd.read_sql(source_query, fourd_connection)
     if len(full_df.columns) != len(target_columns):
         raise ValueError(f"4D extraction returned unexpected columns for {source_table}")
     full_df.columns = target_columns
@@ -769,12 +841,16 @@ def _discover_key_hash_changes(
             else:
                 updated_count += 1
 
+    for key_hash in failed_key_hashes.intersection(old_state):
+        old_hash, modified_at, created_at = _saved_timestamps(old_state[key_hash])
+        new_state.append((table_name, key_hash, old_hash, modified_at, created_at))
+        keyed_rows.add(key_hash)
     changed_df = full_df.iloc[changed_indexes].reset_index(drop=True)
     deleted_count = len(set(old_state) - keyed_rows)
     return (
         changed_df,
         new_state,
-        len(full_df),
+        len(full_df) + len(failed_key_hashes),
         inserted_count,
         updated_count,
         deleted_count,
@@ -1044,7 +1120,7 @@ def _finish_batch(
             counts.get("deleted"),
             counts.get("history"),
             counts.get("failed"),
-            counts.get("exception_count"),
+            counts.get("exception_log_count"),
             change_status,
             new_watermark,
             duration_seconds,
@@ -1180,7 +1256,12 @@ def incremental_load_table(
         "history": 0,
         "failed": 0,
         "exception_count": 0,
+        "exception_log_count": 0,
+        "exception_log_failures": 0,
     }
+    source_extraction_failed_count = 0
+    stage_failed_count = 0
+    source_exception_log_errors: list[str] = []
     old_watermark: datetime | None = None
     paths: dict[str, str] = {}
     stage_table = _qualified_name(database, schema, f"ETL_STAGE_{batch_id.replace('-', '')[:24].upper()}")
@@ -1190,6 +1271,48 @@ def incremental_load_table(
         for column in table_columns
         if column.casefold() in stage_column_names
     ]
+    source_table_for_errors = next(
+        (
+            row["source_table"].strip()
+            for row in metadata_rows
+            if row.get("source_table", "").strip()
+            and row.get("source_column", "").strip()
+            and row.get("target_column", "").strip()
+        ),
+        table_name,
+    )
+
+    def log_source_extraction_failure(
+        row_number: int,
+        record: dict[str, Any],
+        error: Exception,
+    ) -> None:
+        nonlocal source_extraction_failed_count
+        source_extraction_failed_count += 1
+        counts["failed"] = int(counts["failed"] or 0) + 1
+        counts["exception_count"] = int(counts["exception_count"] or 0) + 1
+        log_error = _log_row_failure(
+            exception_logger,
+            pipeline_name=pipeline_name,
+            source_table=source_table_for_errors,
+            target_table=table_name,
+            row_number=row_number,
+            record=record,
+            error=error,
+            batch_id=batch_id,
+            pipeline_run_id=run_id,
+        )
+        if log_error is None:
+            counts["exception_log_count"] = (
+                int(counts["exception_log_count"] or 0) + 1
+            )
+        else:
+            counts["exception_log_failures"] = (
+                int(counts["exception_log_failures"] or 0) + 1
+            )
+            source_exception_log_errors.append(
+                f"row {row_number}: {type(log_error).__name__}: {log_error}"
+            )
 
     try:
         if not snowflake_cursor.execute(
@@ -1247,14 +1370,21 @@ def incremental_load_table(
                 raise ValueError(f"No single complete source mapping for {table_name}")
             source_columns = list(dict.fromkeys(row["source_column"].strip() for row in source_rows))
             target_columns = [row["target_column"].strip() for row in source_rows]
-            initial_df = pd.read_sql(
-                _source_projection_query(
-                    next(iter(source_tables)),
-                    source_columns,
-                    source_rows,
-                ),
+            source_table = next(iter(source_tables))
+            source_records = []
+            for source_batch in iter_source_batches_with_row_isolation(
                 fourd_connection,
-            )
+                _source_projection_query(source_table, source_columns),
+                source_table=source_table,
+                source_columns=source_columns,
+                target_columns=target_columns,
+                metadata_rows=source_rows,
+                key_column=source_primary_key_column(source_rows),
+                batch_size=_KEY_FETCH_SIZE,
+                on_row_failure=log_source_extraction_failure,
+            ):
+                source_records.extend(source_batch)
+            initial_df = pd.DataFrame(source_records, columns=source_columns)
             if len(initial_df.columns) != len(target_columns):
                 raise ValueError(f"Initial extraction returned unexpected columns for {table_name}")
             initial_df.columns = target_columns
@@ -1278,7 +1408,7 @@ def incremental_load_table(
                         f"is not unique in source table {next(iter(source_tables))}"
                     )
             changed_df = initial_df
-            counts["source_scan"] = len(initial_df)
+            counts["source_scan"] = len(initial_df) + source_extraction_failed_count
             counts["extracted"] = len(initial_df)
             counts["changed"] = len(initial_df)
             if strategy["strategy"] in {"KEY_TIMESTAMP", "KEY_HASH"}:
@@ -1295,6 +1425,7 @@ def incremental_load_table(
                     old_state,
                     old_watermark,
                     overlap_seconds,
+                    on_row_failure=log_source_extraction_failure,
                 )
             )
             counts["source_scan"] = source_count
@@ -1321,6 +1452,7 @@ def incremental_load_table(
                 table_name,
                 metadata_rows,
                 old_state,
+                on_row_failure=log_source_extraction_failure,
             )
             counts["source_scan"] = source_count
             counts["extracted"] = source_count
@@ -1424,11 +1556,23 @@ def incremental_load_table(
                 pipeline_name=pipeline_name,
                 source_table=source_table,
                 batch_id=batch_id,
+                pipeline_run_id=run_id,
                 schema_name=f"{_quote_identifier(database)}.{_quote_identifier(schema)}",
                 target_table_name=table_name,
             )
-            counts["failed"] = stage_load["rows_failed"]
-            counts["exception_count"] = stage_load["rows_failed"]
+            stage_failed_count = stage_load["rows_failed"]
+            counts["failed"] = int(counts["failed"] or 0) + stage_failed_count
+            counts["exception_count"] = (
+                int(counts["exception_count"] or 0) + stage_failed_count
+            )
+            counts["exception_log_count"] = (
+                int(counts["exception_log_count"] or 0)
+                + stage_load.get("exception_log_count", stage_failed_count)
+            )
+            counts["exception_log_failures"] = (
+                int(counts["exception_log_failures"] or 0)
+                + stage_load.get("exception_log_failures", 0)
+            )
             if stage_load["failed_indexes"]:
                 failed_frame = changed_df.iloc[
                     stage_load["failed_indexes"]
@@ -1491,6 +1635,14 @@ def incremental_load_table(
             counts,
             new_watermark,
             time.monotonic() - started,
+            "; ".join(
+                [
+                    *source_exception_log_errors,
+                    *stage_load.get("exception_log_errors", []),
+                ]
+            )
+            if exception_logger is not None and counts["exception_log_failures"]
+            else None,
             change_status="CHANGED",
         )
         snowflake_cursor.execute("COMMIT")
@@ -1513,14 +1665,23 @@ def incremental_load_table(
             "batch_id": batch_id,
             "strategy": strategy["strategy"],
             "status": "SUCCESS_WITH_ERRORS" if counts["failed"] else "SUCCESS",
-            "rows_loaded": counts["changed"] - counts["failed"],
-            "rows_processed": counts["changed"],
+            "rows_loaded": counts["changed"] - stage_failed_count,
+            "rows_processed": counts["changed"] + source_extraction_failed_count,
             "rows_failed": counts["failed"],
             "exception_count": counts["exception_count"],
-            "total_records_processed": counts["changed"],
-            "successful_record_count": counts["changed"] - counts["failed"],
+            "total_records_processed": counts["changed"] + source_extraction_failed_count,
+            "successful_record_count": counts["changed"] - stage_failed_count,
             "failed_record_count": counts["failed"],
-            "exception_log_count": counts["exception_count"],
+            "exception_log_count": counts["exception_log_count"],
+            "exception_log_failures": counts["exception_log_failures"],
+            "exception_log_errors": [
+                *source_exception_log_errors,
+                *(
+                    stage_load.get("exception_log_errors", [])
+                    if exception_logger is not None and stage_failed_count
+                    else []
+                ),
+            ],
             "load_started_at": load_started_at.isoformat(),
             "load_ended_at": datetime.now(timezone.utc).isoformat(),
             "watermark": new_watermark,

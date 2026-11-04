@@ -29,6 +29,7 @@ from etl.ddl import (
 from etl.load import (
     build_source_query,
     load_query_to_snowflake_in_batches,
+    source_primary_key_column,
     table_exists_in_snowflake,
 )
 from etl.incremental import (
@@ -80,6 +81,49 @@ def run_for_table(
     )
     audit_ready = False
     pipeline_step_number = None
+    exception_logger = SnowflakeExceptionLogger(
+        snowflake_conn,
+        settings.snowflake_database,
+        settings.snowflake_schema,
+    )
+    systemic_failure_logged = False
+
+    def log_systemic_failure(
+        error: Exception,
+        *,
+        source_table: str | None,
+        target_table: str | None,
+    ) -> None:
+        nonlocal systemic_failure_logged
+        step_name = getattr(audit, "last_failed_step", None)
+        if not isinstance(step_name, str) or not step_name:
+            step_name = "TABLE_OR_PIPELINE_STEP"
+        try:
+            exception_logger.log_step_failure(
+                pipeline_name="4D_TO_SNOWFLAKE_ETL",
+                source_table=source_table or target_table or "ETL_PIPELINE",
+                target_table=target_table or source_table or "ETL_PIPELINE",
+                step_name=step_name,
+                error=error,
+                batch_id=audit.run_id,
+                pipeline_run_id=audit.run_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not record systemic failure for step %s in ETL_EXCEPTION_LOG",
+                step_name,
+            )
+            logger.error(
+                "Systemic ETL failure details: step=%s source=%s target=%s "
+                "error=%s: %s",
+                step_name,
+                source_table,
+                target_table,
+                type(error).__name__,
+                error,
+            )
+        systemic_failure_logged = True
+
     try:
         audit_table_started_at = datetime.now()
         audit.ensure_table()
@@ -105,8 +149,12 @@ def run_for_table(
             "Snowflake audit table is ready",
             start_time=audit_table_started_at,
         )
+        audit.run_step(
+            "ENSURE_EXCEPTION_LOG_TABLE",
+            exception_logger.ensure_table,
+            audit_table_name,
+        )
 
-        mapping_errors: dict[str, str] = {}
         if isinstance(sheet_name, dict):
             metadata = {}
             for table_name, mapping_sheet in sheet_name.items():
@@ -125,11 +173,15 @@ def run_for_table(
                     raise
                 except Exception as exc:
                     logger.exception(
-                        "Could not load mapping for %s; continuing to the next table",
+                        "Could not load mapping for %s; stopping the pipeline",
                         table_name,
                     )
-                    mapping_errors[normalized_table] = str(exc)
-                    metadata[normalized_table] = []
+                    log_systemic_failure(
+                        exc,
+                        source_table=table_name,
+                        target_table=normalized_table,
+                    )
+                    raise
         else:
             metadata = audit.run_step(
                 "LOAD_MAPPING",
@@ -153,16 +205,6 @@ def run_for_table(
 
         snowflake_cursor = audit.run_step("OPEN_SNOWFLAKE_CURSOR", snowflake_conn.cursor)
         try:
-            exception_logger = SnowflakeExceptionLogger(
-                snowflake_conn,
-                settings.snowflake_database,
-                settings.snowflake_schema,
-            )
-            audit.run_step(
-                "ENSURE_EXCEPTION_LOG_TABLE",
-                exception_logger.ensure_table,
-                audit_table_name,
-            )
             fourd_conn = audit.run_step("CONNECT_4D", connect_to_4d)
             try:
                 summary = []
@@ -175,27 +217,24 @@ def run_for_table(
                         and row["target_column"].strip()
                     ]
                     if not source_rows:
-                        error_message = mapping_errors.get(
-                            table_name,
+                        error = ValueError(
                             "No complete source-to-target column mappings "
-                            f"for table: {table_name}",
+                            f"for table: {table_name}"
                         )
-                        logger.error(error_message)
+                        logger.error("%s", error)
                         audit.record(
                             "TABLE_MAPPING",
                             "FAILED",
                             table_name,
-                            error_message,
-                            error_message,
+                            str(error),
+                            str(error),
                         )
-                        summary.append(
-                            {
-                                "table": table_name,
-                                "status": "FAILED",
-                                "error": error_message,
-                            }
+                        log_systemic_failure(
+                            error,
+                            source_table=table_name,
+                            target_table=table_name,
                         )
-                        continue
+                        raise error
 
                     source_table = source_rows[0]["source_table"]
                     source_columns = [row["source_column"] for row in source_rows]
@@ -346,7 +385,11 @@ def run_for_table(
                                 exception_logger=exception_logger,
                                 source_table=source_table,
                                 pipeline_name="4D_TO_SNOWFLAKE_ETL",
+                                pipeline_run_id=audit.run_id,
                                 return_stats=True,
+                                source_columns=source_columns,
+                                metadata_rows=source_rows,
+                                source_key_column=source_primary_key_column(source_rows),
                             ),
                             table_name,
                         )
@@ -369,8 +412,13 @@ def run_for_table(
                         raise
                     except Exception as exc:
                         logger.exception(
-                            "Loading table %s failed; continuing to the next table",
+                            "Loading table %s failed; stopping the pipeline",
                             table_name,
+                        )
+                        log_systemic_failure(
+                            exc,
+                            source_table=source_table,
+                            target_table=table_name,
                         )
                         summary.append(
                             {
@@ -382,6 +430,7 @@ def run_for_table(
                                 "error": str(exc),
                             }
                         )
+                        raise
                     finally:
                         try:
                             audit.run_step(
@@ -401,6 +450,11 @@ def run_for_table(
                                 "Could not release table lock for %s",
                                 table_name,
                             )
+                            log_systemic_failure(
+                                exc,
+                                source_table=source_table,
+                                target_table=table_name,
+                            )
                             if summary and summary[-1].get("table") == table_name:
                                 summary[-1]["status"] = "FAILED"
                                 summary[-1]["error"] = (
@@ -418,6 +472,7 @@ def run_for_table(
                                         "error": f"Lock release failed: {exc}",
                                     }
                                 )
+                            raise
             finally:
                 audit.run_step("CLOSE_4D_CONNECTION", fourd_conn.close, audit_table_name)
         finally:
@@ -439,12 +494,20 @@ def run_for_table(
             if item.get("status") == "NO_CHANGE":
                 return f"No changes for {item['table']}"
             if item.get("status") == "SUCCESS_WITH_ERRORS":
-                return (
+                message = (
                     f"Loaded {item['rows_loaded']} of "
                     f"{item.get('rows_processed', item['rows_loaded'])} rows into "
                     f"{item['table']} with {item.get('rows_failed', 0)} row error(s); "
-                    f"{item.get('exception_count', 0)} exception(s) logged"
+                    f"{item.get('exception_log_count', item.get('exception_count', 0))} "
+                    "exception(s) logged"
                 )
+                log_failures = item.get("exception_log_failures", 0)
+                if log_failures:
+                    message += (
+                        f"; {log_failures} error-log write(s) failed: "
+                        + "; ".join(item.get("exception_log_errors", []))
+                    )
+                return message
             if item.get("status") == "FAILED":
                 return f"Failed to load {item['table']}: {item.get('error', 'unknown error')}"
             return f"Loaded {item['rows_loaded']} rows into {item['table']}"
@@ -469,6 +532,12 @@ def run_for_table(
         raise
     except Exception as exc:
         logger.exception("ETL execution failed")
+        if not systemic_failure_logged:
+            log_systemic_failure(
+                exc,
+                source_table=audit_table_name,
+                target_table=audit_table_name,
+            )
         if audit_ready and pipeline_step_number is not None:
             try:
                 audit.finish_step(
@@ -609,8 +678,15 @@ def main() -> int:
                     f"Loaded {item['rows_loaded']} of {item['rows_processed']} rows into "
                     f"{item['table']} from {item['source_table']}; "
                     f"{item['rows_failed']} row error(s), "
-                    f"{item['exception_count']} exception(s) logged"
+                    f"{item.get('exception_log_count', item['exception_count'])} "
+                    "exception(s) logged"
                 )
+                if item.get("exception_log_failures"):
+                    table_failures = True
+                    message += (
+                        f"; {item['exception_log_failures']} exception-log write(s) "
+                        "failed"
+                    )
             elif item.get("status") == "FAILED":
                 table_failures = True
                 message = (

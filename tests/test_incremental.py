@@ -72,15 +72,68 @@ def _timestamp_metadata_cursor():
 
 
 class IncrementalStrategyTests(unittest.TestCase):
+    def test_primary_key_parser_ignores_negative_constraint_note(self):
+        rows = _claim_mapping()
+        rows[0]["constraint"] = "There is no primary key for this table"
+
+        self.assertEqual(incremental._primary_key_columns(rows), [])
+        self.assertEqual(
+            incremental.select_change_strategy(rows)["strategy"],
+            "ROW_HASH",
+        )
+
+    def test_timestamp_scan_logs_bad_row_and_preserves_old_key_state(self):
+        source_connection = Mock()
+        old_modified = datetime(2024, 1, 1)
+        old_state = {
+            incremental._source_key(1): ("hash-1", old_modified),
+            incremental._source_key(2): ("hash-2", old_modified),
+        }
+        source_failure = Mock()
+
+        def source_batches(*_args, **kwargs):
+            kwargs["on_row_failure"](
+                2,
+                {"CLAIM_ID": 2, "MODIFIED_ON": {"__unavailable__": "ODBC error"}},
+                ValueError("year 12015 is out of range"),
+            )
+            yield [(1, old_modified)]
+
+        with (
+            patch.object(incremental, "_validate_timestamp_metadata"),
+            patch.object(
+                incremental,
+                "iter_source_batches_with_row_isolation",
+                side_effect=source_batches,
+            ),
+        ):
+            _, new_state, source_count, _, _, deleted_count = (
+                incremental._discover_timestamp_changes(
+                    source_connection,
+                    "CLAIMS",
+                    _claim_mapping(),
+                    old_state,
+                    datetime(2025, 1, 1),
+                    0,
+                    on_row_failure=source_failure,
+                )
+            )
+
+        self.assertEqual(source_count, 2)
+        self.assertEqual(deleted_count, 0)
+        self.assertEqual({row[1] for row in new_state}, set(old_state))
+        source_failure.assert_called_once()
+
     def test_temporal_source_projection_avoids_odbc_datetime_conversion(self):
         query = incremental._source_projection_query(
             "Claims",
             ["Claim ID", "Modified On"],
-            _claim_mapping(),
         )
 
-        self.assertIn("SELECT [Claim ID], CAST([Modified On] AS VARCHAR(100))", query)
-        self.assertIn("AS [Modified On] FROM [Claims]", query)
+        self.assertEqual(
+            query,
+            "SELECT [Claim ID], [Modified On] FROM [Claims]",
+        )
 
     def test_out_of_range_timestamp_text_is_left_for_row_level_load_handling(self):
         self.assertIsNone(
@@ -701,7 +754,13 @@ class IncrementalTransactionTests(unittest.TestCase):
             stage_loader = stack.enter_context(
                 patch.object(incremental, "load_dataframe_to_snowflake")
             )
-            stack.enter_context(patch("etl.incremental.pd.read_sql", return_value=initial))
+            stack.enter_context(
+                patch.object(
+                    incremental,
+                    "iter_source_batches_with_row_isolation",
+                    return_value=iter([list(initial.itertuples(index=False, name=None))]),
+                )
+            )
             result = incremental.incremental_load_table(
                 Mock(),
                 connection,
@@ -751,8 +810,12 @@ class IncrementalTransactionTests(unittest.TestCase):
         exception_logger = Mock()
         with contextlib.ExitStack() as stack:
             self._patch_initial_dependencies(stack)
-            read_sql = stack.enter_context(
-                patch("etl.incremental.pd.read_sql", return_value=initial)
+            stack.enter_context(
+                patch.object(
+                    incremental,
+                    "iter_source_batches_with_row_isolation",
+                    return_value=iter([list(initial.itertuples(index=False, name=None))]),
+                )
             )
             stage_load = stack.enter_context(
                 patch.object(
@@ -762,6 +825,11 @@ class IncrementalTransactionTests(unittest.TestCase):
                         "rows_loaded": 1,
                         "rows_failed": 1,
                         "failed_indexes": [1],
+                        "exception_log_count": 0,
+                        "exception_log_failures": 1,
+                        "exception_log_errors": [
+                            "row 2: RuntimeError: exception log unavailable"
+                        ],
                     },
                 )
             )
@@ -787,6 +855,12 @@ class IncrementalTransactionTests(unittest.TestCase):
         self.assertEqual(result["rows_loaded"], 1)
         self.assertEqual(result["rows_failed"], 1)
         self.assertEqual(result["exception_count"], 1)
+        self.assertEqual(result["exception_log_count"], 0)
+        self.assertEqual(result["exception_log_failures"], 1)
+        self.assertEqual(
+            result["exception_log_errors"],
+            ["row 2: RuntimeError: exception log unavailable"],
+        )
         self.assertEqual(finish.call_args.args[3], "SUCCESS_WITH_ERRORS")
         self.assertEqual(finish.call_args.args[4]["failed"], 1)
         self.assertEqual(finish.call_args.args[4]["exception_count"], 1)
@@ -798,7 +872,79 @@ class IncrementalTransactionTests(unittest.TestCase):
             stage_load.call_args.kwargs["target_table_name"],
             "CLAIMS",
         )
-        self.assertIn("CAST([Modified On] AS VARCHAR(100))", read_sql.call_args.args[0])
+
+    def test_initial_incremental_load_logs_source_fetch_error_and_continues(self):
+        import contextlib
+
+        cursor = Mock()
+        cursor.execute.return_value = cursor
+        cursor.fetchone.return_value = (0,)
+        connection = Mock()
+        exception_logger = Mock()
+
+        def source_batches(*_args, **kwargs):
+            kwargs["on_row_failure"](
+                2,
+                {
+                    "CLAIM_ID": 2,
+                    "MODIFIED_ON": {"__unavailable__": "ODBC conversion failed"},
+                },
+                ValueError("year 12015 is out of range"),
+            )
+            yield [
+                (1, datetime(2025, 1, 1), 10),
+                (3, datetime(2025, 1, 3), 30),
+            ]
+
+        with contextlib.ExitStack() as stack:
+            self._patch_initial_dependencies(stack)
+            stack.enter_context(
+                patch.object(
+                    incremental,
+                    "iter_source_batches_with_row_isolation",
+                    side_effect=source_batches,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    incremental,
+                    "load_dataframe_to_snowflake_with_exceptions",
+                    return_value={
+                        "rows_loaded": 2,
+                        "rows_failed": 0,
+                        "failed_indexes": [],
+                        "exception_log_count": 0,
+                        "exception_log_failures": 0,
+                        "exception_log_errors": [],
+                    },
+                )
+            )
+            stack.enter_context(patch.object(incremental, "_replace_row_state"))
+            stack.enter_context(patch.object(incremental, "_finish_batch"))
+
+            result = incremental.incremental_load_table(
+                Mock(),
+                connection,
+                cursor,
+                "DW_TEST",
+                "RAW_TEST",
+                "CLAIMS",
+                _claim_mapping(),
+                "run-with-source-fetch-error",
+                exception_logger=exception_logger,
+            )
+
+        self.assertEqual(result["status"], "SUCCESS_WITH_ERRORS")
+        self.assertEqual(result["rows_processed"], 3)
+        self.assertEqual(result["rows_loaded"], 2)
+        self.assertEqual(result["rows_failed"], 1)
+        self.assertEqual(result["exception_log_count"], 1)
+        self.assertEqual(result["exception_log_failures"], 0)
+        exception_logger.log_row_failure.assert_called_once()
+        self.assertEqual(
+            exception_logger.log_row_failure.call_args.kwargs["error"].args[0],
+            "year 12015 is out of range",
+        )
 
     def test_no_change_batch_keeps_current_history_and_watermark_unchanged(self):
         import contextlib

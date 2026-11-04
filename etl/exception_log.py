@@ -47,6 +47,7 @@ class SnowflakeExceptionLogger:
                 CREATE TABLE IF NOT EXISTS {self.qualified_table} (
                     ERROR_ID VARCHAR(64) NOT NULL,
                     PIPELINE_NAME VARCHAR(255) NOT NULL,
+                    PIPELINE_RUN_ID VARCHAR(36),
                     SOURCE_TABLE VARCHAR(255) NOT NULL,
                     TARGET_TABLE VARCHAR(255) NOT NULL,
                     ROW_NUMBER NUMBER(38, 0) NOT NULL,
@@ -58,6 +59,10 @@ class SnowflakeExceptionLogger:
                     RETRY_STATUS VARCHAR(20) DEFAULT 'PENDING'
                 )
                 """
+            )
+            cursor.execute(
+                f"ALTER TABLE {self.qualified_table} "
+                "ADD COLUMN IF NOT EXISTS PIPELINE_RUN_ID VARCHAR(36)"
             )
         finally:
             cursor.close()
@@ -72,6 +77,7 @@ class SnowflakeExceptionLogger:
         record: dict[str, Any],
         error: BaseException,
         batch_id: str,
+        pipeline_run_id: str | None = None,
     ) -> None:
         record_json = json.dumps(
             record,
@@ -108,11 +114,11 @@ class SnowflakeExceptionLogger:
                 ) source
                 ON target.ERROR_ID = source.ERROR_ID
                 WHEN NOT MATCHED THEN INSERT (
-                    ERROR_ID, PIPELINE_NAME, SOURCE_TABLE, TARGET_TABLE,
-                    ROW_NUMBER, RECORD_DATA, ERROR_MESSAGE, ERROR_TYPE,
+                    ERROR_ID, PIPELINE_NAME, PIPELINE_RUN_ID, SOURCE_TABLE,
+                    TARGET_TABLE, ROW_NUMBER, RECORD_DATA, ERROR_MESSAGE, ERROR_TYPE,
                     ERROR_TIMESTAMP, BATCH_ID, RETRY_STATUS
                 ) VALUES (
-                    %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s,
+                    %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, %s,
                     CURRENT_TIMESTAMP(), %s, 'PENDING'
                 )
                 """,
@@ -120,6 +126,7 @@ class SnowflakeExceptionLogger:
                     error_id,
                     error_id,
                     pipeline_name,
+                    pipeline_run_id,
                     source_table,
                     target_table,
                     row_number,
@@ -139,3 +146,29 @@ class SnowflakeExceptionLogger:
             raise
         finally:
             cursor.close()
+
+    def log_step_failure(
+        self,
+        *,
+        pipeline_name: str,
+        source_table: str,
+        target_table: str,
+        step_name: str,
+        error: BaseException,
+        batch_id: str,
+        pipeline_run_id: str | None = None,
+    ) -> None:
+        self.log_row_failure(
+            pipeline_name=pipeline_name,
+            source_table=source_table,
+            target_table=target_table,
+            row_number=0,
+            record={
+                "__failure_scope__": "PIPELINE_STEP",
+                "__step__": step_name,
+                "__row_data_available__": False,
+            },
+            error=error,
+            batch_id=batch_id,
+            pipeline_run_id=pipeline_run_id,
+        )
