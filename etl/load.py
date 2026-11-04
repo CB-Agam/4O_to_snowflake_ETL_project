@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import re
 import tempfile
 from collections.abc import Callable
 from datetime import date, datetime, time, timezone
@@ -26,6 +27,12 @@ class RowLoadError(RuntimeError):
 
 def _is_row_level_error(error: BaseException) -> bool:
     if isinstance(error, RowLoadError):
+        return True
+    if isinstance(error, ValueError) and re.search(
+        r"\byear \d+ is out of range\b",
+        str(error),
+        re.IGNORECASE,
+    ):
         return True
     sqlstate = str(getattr(error, "sqlstate", "") or "")
     if sqlstate.startswith(("22", "23")):

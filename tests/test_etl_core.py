@@ -1134,6 +1134,54 @@ class EtlCoreTests(unittest.TestCase):
         )
         self.assertEqual(connection.rollback.call_count, 3)
 
+    def test_dataframe_exception_loader_completes_100_rows_with_one_bad_date(self):
+        cursor = Mock()
+        connection = Mock()
+        exception_logger = Mock()
+        committed_ids = []
+
+        def executemany(_sql, rows):
+            if any(row[0] == 10 for row in rows):
+                raise ValueError("year 12015 is out of range")
+            committed_ids.extend(row[0] for row in rows)
+
+        cursor.executemany.side_effect = executemany
+        dataframe = pd.DataFrame(
+            {
+                "ID": range(1, 101),
+                "MODIFIED_ON": [
+                    "12015-01-01 00:00:00" if row_id == 10
+                    else "2025-01-01 00:00:00"
+                    for row_id in range(1, 101)
+                ],
+            }
+        )
+
+        result = load_dataframe_to_snowflake_with_exceptions(
+            connection,
+            cursor,
+            "STAGE",
+            ["ID", "MODIFIED_ON"],
+            dataframe,
+            exception_logger=exception_logger,
+            pipeline_name="TEST",
+            source_table="SOURCE",
+            batch_id="batch-100",
+        )
+
+        self.assertEqual(
+            result,
+            {"rows_loaded": 99, "rows_failed": 1, "failed_indexes": [9]},
+        )
+        self.assertEqual(sorted(committed_ids), [*range(1, 10), *range(11, 101)])
+        exception_logger.log_row_failure.assert_called_once()
+        logged_failure = exception_logger.log_row_failure.call_args.kwargs
+        self.assertEqual(logged_failure["row_number"], 10)
+        self.assertEqual(
+            logged_failure["record"],
+            {"ID": 10, "MODIFIED_ON": "12015-01-01 00:00:00"},
+        )
+
     def test_dataframe_exception_loader_logs_multiple_failed_rows(self):
         class ConversionError(Exception):
             sqlstate = "22003"
