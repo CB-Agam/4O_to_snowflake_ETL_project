@@ -106,18 +106,30 @@ def run_for_table(
             start_time=audit_table_started_at,
         )
 
+        mapping_errors: dict[str, str] = {}
         if isinstance(sheet_name, dict):
             metadata = {}
             for table_name, mapping_sheet in sheet_name.items():
-                table_metadata = audit.run_step(
-                    "LOAD_MAPPING",
-                    lambda mapping_sheet=mapping_sheet: load_metadata_from_excel(
-                        excel_path,
-                        sheet_name=mapping_sheet,
-                    ),
-                    table_name,
-                )
-                metadata.update(table_metadata)
+                normalized_table = _normalize_target_table_name(table_name)
+                try:
+                    table_metadata = audit.run_step(
+                        "LOAD_MAPPING",
+                        lambda mapping_sheet=mapping_sheet: load_metadata_from_excel(
+                            excel_path,
+                            sheet_name=mapping_sheet,
+                        ),
+                        table_name,
+                    )
+                    metadata.update(table_metadata)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "Could not load mapping for %s; continuing to the next table",
+                        table_name,
+                    )
+                    mapping_errors[normalized_table] = str(exc)
+                    metadata[normalized_table] = []
         else:
             metadata = audit.run_step(
                 "LOAD_MAPPING",
@@ -133,7 +145,7 @@ def run_for_table(
                 name: metadata.get(name, []) for name in normalized_targets
             }
 
-        if not selected_tables or not any(selected_tables.values()):
+        if not selected_tables:
             raise ValueError(
                 "No source-to-target mappings found for table(s): "
                 f"{audit_table_name or sheet_name}"
@@ -163,24 +175,63 @@ def run_for_table(
                         and row["target_column"].strip()
                     ]
                     if not source_rows:
-                        raise ValueError(f"No complete source-to-target column mappings for table: {table_name}")
+                        error_message = mapping_errors.get(
+                            table_name,
+                            "No complete source-to-target column mappings "
+                            f"for table: {table_name}",
+                        )
+                        logger.error(error_message)
+                        audit.record(
+                            "TABLE_MAPPING",
+                            "FAILED",
+                            table_name,
+                            error_message,
+                            error_message,
+                        )
+                        summary.append(
+                            {
+                                "table": table_name,
+                                "status": "FAILED",
+                                "error": error_message,
+                            }
+                        )
+                        continue
 
                     source_table = source_rows[0]["source_table"]
                     source_columns = [row["source_column"] for row in source_rows]
                     target_columns = [row["target_column"] for row in source_rows]
 
-                    table_lock = audit.run_step(
-                        "ACQUIRE_TABLE_LOCK",
-                        lambda: acquire_table_run_lock(
-                            snowflake_cursor,
-                            snowflake_conn,
-                            settings.snowflake_database,
-                            settings.snowflake_schema,
+                    try:
+                        table_lock = audit.run_step(
+                            "ACQUIRE_TABLE_LOCK",
+                            lambda: acquire_table_run_lock(
+                                snowflake_cursor,
+                                snowflake_conn,
+                                settings.snowflake_database,
+                                settings.snowflake_schema,
+                                table_name,
+                                rows,
+                            ),
                             table_name,
-                            rows,
-                        ),
-                        table_name,
-                    )
+                        )
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        logger.exception(
+                            "Could not acquire table lock for %s; continuing to the next table",
+                            table_name,
+                        )
+                        summary.append(
+                            {
+                                "table": table_name,
+                                "source_table": source_table,
+                                "source_columns": source_columns,
+                                "target_columns": target_columns,
+                                "status": "FAILED",
+                                "error": str(exc),
+                            }
+                        )
+                        continue
                     try:
                         exists = audit.run_step(
                             "CHECK_TARGET_TABLE",
@@ -314,17 +365,59 @@ def run_for_table(
                             "target_columns": target_columns,
                             **load_result,
                         })
-                    finally:
-                        audit.run_step(
-                            "RELEASE_TABLE_LOCK",
-                            lambda: release_table_run_lock(
-                                snowflake_cursor,
-                                snowflake_conn,
-                                table_lock,
-                                table_name,
-                            ),
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:
+                        logger.exception(
+                            "Loading table %s failed; continuing to the next table",
                             table_name,
                         )
+                        summary.append(
+                            {
+                                "table": table_name,
+                                "source_table": source_table,
+                                "source_columns": source_columns,
+                                "target_columns": target_columns,
+                                "status": "FAILED",
+                                "error": str(exc),
+                            }
+                        )
+                    finally:
+                        try:
+                            audit.run_step(
+                                "RELEASE_TABLE_LOCK",
+                                lambda: release_table_run_lock(
+                                    snowflake_cursor,
+                                    snowflake_conn,
+                                    table_lock,
+                                    table_name,
+                                ),
+                                table_name,
+                            )
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as exc:
+                            logger.exception(
+                                "Could not release table lock for %s",
+                                table_name,
+                            )
+                            if summary and summary[-1].get("table") == table_name:
+                                summary[-1]["status"] = "FAILED"
+                                summary[-1]["error"] = (
+                                    f"{summary[-1].get('error', '')} "
+                                    f"Lock release failed: {exc}"
+                                ).strip()
+                            else:
+                                summary.append(
+                                    {
+                                        "table": table_name,
+                                        "source_table": source_table,
+                                        "source_columns": source_columns,
+                                        "target_columns": target_columns,
+                                        "status": "FAILED",
+                                        "error": f"Lock release failed: {exc}",
+                                    }
+                                )
             finally:
                 audit.run_step("CLOSE_4D_CONNECTION", fourd_conn.close, audit_table_name)
         finally:
@@ -335,7 +428,10 @@ def run_for_table(
             )
         final_status = (
             "SUCCESS_WITH_ERRORS"
-            if any(item.get("status") == "SUCCESS_WITH_ERRORS" for item in summary)
+            if any(
+                item.get("status") in {"SUCCESS_WITH_ERRORS", "FAILED"}
+                for item in summary
+            )
             else "SUCCESS"
         )
 
@@ -349,6 +445,8 @@ def run_for_table(
                     f"{item['table']} with {item.get('rows_failed', 0)} row error(s); "
                     f"{item.get('exception_count', 0)} exception(s) logged"
                 )
+            if item.get("status") == "FAILED":
+                return f"Failed to load {item['table']}: {item.get('error', 'unknown error')}"
             return f"Loaded {item['rows_loaded']} rows into {item['table']}"
 
         audit.finish_step(
@@ -502,6 +600,7 @@ def main() -> int:
             overlap_seconds=args.overlap_seconds,
             batch_size=args.batch_size,
         )
+        table_failures = False
         for item in result["tables"]:
             if item.get("status") == "NO_CHANGE":
                 message = f"No changes detected for {item['table']}"
@@ -512,18 +611,27 @@ def main() -> int:
                     f"{item['rows_failed']} row error(s), "
                     f"{item['exception_count']} exception(s) logged"
                 )
+            elif item.get("status") == "FAILED":
+                table_failures = True
+                message = (
+                    f"Failed to load {item['table']}: "
+                    f"{item.get('error', 'unknown error')}"
+                )
             else:
                 message = (
                     f"Loaded {item['rows_loaded']} changed rows into {item['table']} "
                     f"from {item['source_table']}"
                 )
-            logger.info(message)
+            if item.get("status") == "FAILED":
+                logger.error(message)
+            else:
+                logger.info(message)
             print(message)
 
-        if any(
-            item.get("status") == "SUCCESS_WITH_ERRORS"
-            for item in result["tables"]
-        ):
+        if table_failures:
+            logger.warning("ETL run completed with one or more failed tables")
+            return 1
+        if any(item.get("status") == "SUCCESS_WITH_ERRORS" for item in result["tables"]):
             logger.warning("ETL run completed with row-level errors")
         else:
             logger.info("ETL run completed successfully")

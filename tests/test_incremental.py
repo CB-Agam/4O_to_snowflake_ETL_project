@@ -72,6 +72,28 @@ def _timestamp_metadata_cursor():
 
 
 class IncrementalStrategyTests(unittest.TestCase):
+    def test_temporal_source_projection_avoids_odbc_datetime_conversion(self):
+        query = incremental._source_projection_query(
+            "Claims",
+            ["Claim ID", "Modified On"],
+            _claim_mapping(),
+        )
+
+        self.assertIn("SELECT [Claim ID], CAST([Modified On] AS VARCHAR(100))", query)
+        self.assertIn("AS [Modified On] FROM [Claims]", query)
+
+    def test_out_of_range_timestamp_text_is_left_for_row_level_load_handling(self):
+        self.assertIsNone(
+            incremental._normalize_optional_timestamp("12015-01-01 00:00:00", "Modified On")
+        )
+        self.assertEqual(
+            incremental._normalize_optional_timestamp(
+                "2025-01-02 03:04:05",
+                "Modified On",
+            ),
+            datetime(2025, 1, 2, 3, 4, 5),
+        )
+
     def test_failed_timestamp_row_keeps_previous_state_for_next_run(self):
         old_modified = datetime(2024, 1, 1)
         old_created = datetime(2023, 1, 1)
@@ -721,7 +743,7 @@ class IncrementalTransactionTests(unittest.TestCase):
                 "CLAIM_ID": [1, 2],
                 "MODIFIED_ON": [
                     datetime(2025, 1, 1),
-                    datetime(2025, 1, 2),
+                    "12015-01-02 00:00:00",
                 ],
                 "AMOUNT": [10, 20],
             }
@@ -729,7 +751,9 @@ class IncrementalTransactionTests(unittest.TestCase):
         exception_logger = Mock()
         with contextlib.ExitStack() as stack:
             self._patch_initial_dependencies(stack)
-            stack.enter_context(patch("etl.incremental.pd.read_sql", return_value=initial))
+            read_sql = stack.enter_context(
+                patch("etl.incremental.pd.read_sql", return_value=initial)
+            )
             stage_load = stack.enter_context(
                 patch.object(
                     incremental,
@@ -774,6 +798,7 @@ class IncrementalTransactionTests(unittest.TestCase):
             stage_load.call_args.kwargs["target_table_name"],
             "CLAIMS",
         )
+        self.assertIn("CAST([Modified On] AS VARCHAR(100))", read_sql.call_args.args[0])
 
     def test_no_change_batch_keeps_current_history_and_watermark_unchanged(self):
         import contextlib

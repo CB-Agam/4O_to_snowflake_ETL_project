@@ -16,7 +16,6 @@ import pandas as pd
 
 from etl.exception_log import SnowflakeExceptionLogger
 from etl.load import (
-    build_source_query,
     load_dataframe_to_snowflake,
     load_dataframe_to_snowflake_with_exceptions,
 )
@@ -24,6 +23,13 @@ from etl.load import (
 logger = logging.getLogger(__name__)
 
 _TIMESTAMP_TYPE_NAMES = {"TIMESTAMP", "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "DATETIME"}
+_TEMPORAL_SOURCE_TYPE_NAMES = {
+    "DATE",
+    "DATETIME",
+    "DATETIME2",
+    "TIME",
+    "TIMESTAMP",
+}
 _BATCH_LOG_NAME = "ETL_INCREMENTAL_BATCH_LOG"
 _STATE_NAME = "ETL_INCREMENTAL_TABLE_STATE"
 _ROW_STATE_NAME = "ETL_SOURCE_ROW_STATE"
@@ -211,9 +217,14 @@ def _source_key(value: Any) -> str:
     return _canonical_json(value)
 
 
-def _normalize_timestamp(value: Any, key: str) -> datetime:
+def _normalize_timestamp(value: Any, key: str) -> datetime | None:
     if value is None or pd.isna(value):
         raise ValueError(f"Source modification timestamp {key!r} contains NULL")
+    if isinstance(value, str):
+        try:
+            value = pd.Timestamp(value)
+        except (OverflowError, TypeError, ValueError):
+            return None
     if not isinstance(value, (datetime, date, pd.Timestamp)):
         raise ValueError(
             f"Source modification field {key!r} returned non-timestamp value "
@@ -231,8 +242,36 @@ def _normalize_optional_timestamp(value: Any, key: str) -> datetime | None:
     return _normalize_timestamp(value, key)
 
 
-def _source_projection_query(source_table: str, columns: Sequence[str]) -> str:
-    return build_source_query(source_table, columns)
+def _source_projection_query(
+    source_table: str,
+    columns: Sequence[str],
+    metadata_rows: Sequence[dict[str, str]] = (),
+) -> str:
+    source_types = {
+        row.get("source_column", "").strip().casefold():
+        row.get("source_data_type", "").strip().upper().split("(", 1)[0]
+        for row in metadata_rows
+    }
+
+    def quote_identifier(identifier: str) -> str:
+        return "[" + identifier.replace("]", "]]") + "]"
+
+    projection = []
+    for column in columns:
+        quoted_column = quote_identifier(column)
+        source_type = source_types.get(column.casefold(), "")
+        if source_type in _TEMPORAL_SOURCE_TYPE_NAMES:
+            projection.append(
+                f"CAST({quoted_column} AS VARCHAR(100)) AS {quoted_column}"
+            )
+        else:
+            projection.append(quoted_column)
+    if not projection:
+        raise ValueError(f"No source columns provided for table: {source_table}")
+    return (
+        f"SELECT {', '.join(projection)} "
+        f"FROM {quote_identifier(source_table.strip())}"
+    )
 
 
 def _rows_as_state(
@@ -389,10 +428,15 @@ def _fetch_full_rows_for_keys(
     keys: Sequence[Any],
     key_target_column: str,
     target_columns: Sequence[str],
+    metadata_rows: Sequence[dict[str, str]],
 ) -> pd.DataFrame:
     if not keys:
         return pd.DataFrame(columns=target_columns)
-    source_query = _source_projection_query(source_table, source_columns)
+    source_query = _source_projection_query(
+        source_table,
+        source_columns,
+        metadata_rows,
+    )
     chunks: list[pd.DataFrame] = []
     for start in range(0, len(keys), _KEY_FETCH_SIZE):
         key_chunk = keys[start : start + _KEY_FETCH_SIZE]
@@ -474,7 +518,11 @@ def _discover_timestamp_changes(
             key_source,
             timestamp_column,
         )
-    scan_query = build_source_query(source_table, required_scan_columns)
+    scan_query = _source_projection_query(
+        source_table,
+        required_scan_columns,
+        source_rows,
+    )
     scan_df = pd.read_sql(scan_query, fourd_connection)
     if len(scan_df.columns) != len(required_scan_columns):
         raise ValueError(
@@ -545,6 +593,7 @@ def _discover_timestamp_changes(
         keys_to_fetch,
         key_target,
         target_columns,
+        rows,
     )
     changed_by_key: dict[str, tuple[str, datetime | None, datetime | None]] = {}
     changed_keys: set[str] = set()
@@ -631,7 +680,7 @@ def _discover_hash_changes(
     source_table = next(iter(source_tables))
     source_columns = list(dict.fromkeys(row["source_column"].strip() for row in source_rows))
     target_columns = [row["target_column"].strip() for row in source_rows]
-    source_query = _source_projection_query(source_table, source_columns)
+    source_query = _source_projection_query(source_table, source_columns, rows)
     full_df = pd.read_sql(source_query, fourd_connection)
     if len(full_df.columns) != len(target_columns):
         raise ValueError(f"4D extraction returned unexpected columns for {source_table}")
@@ -687,7 +736,7 @@ def _discover_key_hash_changes(
 
     source_table = next(iter(source_tables))
     full_df = pd.read_sql(
-        _source_projection_query(source_table, source_columns),
+        _source_projection_query(source_table, source_columns, rows),
         fourd_connection,
     )
     if len(full_df.columns) != len(target_columns):
@@ -1199,7 +1248,11 @@ def incremental_load_table(
             source_columns = list(dict.fromkeys(row["source_column"].strip() for row in source_rows))
             target_columns = [row["target_column"].strip() for row in source_rows]
             initial_df = pd.read_sql(
-                build_source_query(next(iter(source_tables)), source_columns),
+                _source_projection_query(
+                    next(iter(source_tables)),
+                    source_columns,
+                    source_rows,
+                ),
                 fourd_connection,
             )
             if len(initial_df.columns) != len(target_columns):

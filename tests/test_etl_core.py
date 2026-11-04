@@ -376,6 +376,60 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(snowflake_cursor.close.call_count, 2)
         snowflake_connection.close.assert_called_once()
 
+    @patch("scripts.run_initial_etl.load_query_to_snowflake_in_batches", return_value=1)
+    @patch(
+        "scripts.run_initial_etl.table_exists_in_snowflake",
+        side_effect=[RuntimeError("first table check failed"), True],
+    )
+    @patch("scripts.run_initial_etl.connect_to_4d")
+    @patch("scripts.run_initial_etl.load_metadata_from_excel")
+    @patch("scripts.run_initial_etl.SnowflakeAuditLogger")
+    @patch("scripts.run_initial_etl.connect_to_snowflake")
+    def test_run_for_table_continues_after_a_table_step_fails(
+        self,
+        connect_snowflake,
+        audit_logger,
+        load_metadata,
+        connect_4d,
+        _table_exists,
+        load_in_batches,
+    ):
+        load_metadata.side_effect = lambda _path, sheet_name: {
+            f"{sheet_name.upper()}": [{
+                "source_table": sheet_name,
+                "source_column": "Source Column",
+                "target_column": "SOURCE_COLUMN",
+            }]
+        }
+        snowflake_connection = Mock()
+        snowflake_cursor = Mock()
+        snowflake_connection.cursor.return_value = snowflake_cursor
+        connect_snowflake.return_value = snowflake_connection
+        connect_4d.return_value = Mock()
+        audit = Mock()
+        audit.run_id = "test-run-id"
+        audit.run_step.side_effect = lambda _step, action, _table_name=None: action()
+        audit_logger.return_value = audit
+
+        with (
+            patch("scripts.run_initial_etl.acquire_table_run_lock", return_value={}),
+            patch("scripts.run_initial_etl.renew_table_run_lock"),
+            patch("scripts.run_initial_etl.release_table_run_lock"),
+        ):
+            result = run_initial_etl.run_for_table(
+                "mapping.xlsx",
+                {"FIRST": "First", "SECOND": "Second"},
+                ["FIRST", "SECOND"],
+            )
+
+        self.assertEqual(
+            [item["status"] for item in result["tables"]],
+            ["FAILED", "SUCCESS"],
+        )
+        self.assertEqual(result["tables"][0]["error"], "first table check failed")
+        self.assertEqual(load_in_batches.call_count, 1)
+        self.assertEqual(audit.finish_step.call_args.args[1], "SUCCESS_WITH_ERRORS")
+
     def test_pipeline_logging_writes_full_exception_to_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             log_path = Path(temp_dir) / "etl_pipeline.log"
@@ -482,6 +536,25 @@ class EtlCoreTests(unittest.TestCase):
             overlap_seconds=86400,
             batch_size=50_000,
         )
+
+    @patch(
+        "scripts.run_initial_etl.run_for_table",
+        return_value={
+            "tables": [
+                {"table": "REPORTS", "status": "FAILED", "error": "source unavailable"}
+            ]
+        },
+    )
+    @patch(
+        "scripts.run_initial_etl._parse_args",
+        return_value=_parse_args(["--table", "REPORTS", "--sheet", "Reports"]),
+    )
+    def test_cli_returns_failure_after_reporting_all_table_results(
+        self,
+        _parse_args_mock,
+        _run_for_table,
+    ):
+        self.assertEqual(run_initial_etl.main(), 1)
 
     def test_cli_accepts_custom_bulk_load_batch_size(self):
         args = _parse_args(["--table", "Alerts", "--batch-size", "2500"])

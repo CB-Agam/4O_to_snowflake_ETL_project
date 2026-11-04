@@ -128,6 +128,16 @@ For a target such as `CLAIMS`:
 5. A DML transaction replaces current data and persists the source-row state,
    watermark, and successful batch status together.
 
+Mapped temporal source columns are selected as text during incremental
+extraction so an ODBC date value outside Python's supported year range cannot
+abort the fetch for the entire table. Snowflake validates the value during
+staging: an invalid temporal row is written to `ETL_EXCEPTION_LOG`, while valid
+rows continue to load and the failed row remains pending for a later run.
+Pipeline execution also records a failed table in the audit log and proceeds
+with the next selected table. The overall run is reported as
+`SUCCESS_WITH_ERRORS` when any table fails; the CLI exits nonzero after all
+selected tables have been attempted if any table failed.
+
 Expected result: `CLAIMS` contains the initial source dataset and `CLAIMS_H`
 has no copied initial batch.
 
