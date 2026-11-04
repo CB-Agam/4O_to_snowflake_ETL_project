@@ -19,6 +19,7 @@ from config.settings import Settings
 from connections.fourd_connection import connect_to_4d
 from connections.snowflake_connection import connect_to_snowflake
 from etl.load import (
+    _snowflake_local_file_uri,
     build_insert_sql,
     build_source_query,
     load_dataframe_to_snowflake,
@@ -29,6 +30,26 @@ from scripts.run_initial_etl import _parse_args
 
 
 class EtlCoreTests(unittest.TestCase):
+    def test_snowflake_local_file_uri_uses_windows_compatible_form(self):
+        with patch("etl.load.os.name", "nt"):
+            uri = _snowflake_local_file_uri(Path("C:/Users/test/Temp/file.json"))
+            self.assertEqual(uri, "file://C:/Users/test/Temp/file.json")
+
+    def test_find_mapping_sheet_falls_back_to Alternate_workbook(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            wrong_workbook = project_dir / "4D_to_Snowflake mapping document.xlsx"
+            fallback_workbook = project_dir / "4D_to_Snowflake (1-50 tables mapping).xlsx"
+            with pd.ExcelWriter(wrong_workbook) as writer:
+                pd.DataFrame({"Source table": ["Reports"], "Source column": ["ID"], "Target table": ["Reports"], "Target column": ["ID"]}).to_excel(writer, index=False, sheet_name="Reports")
+            with pd.ExcelWriter(fallback_workbook) as writer:
+                pd.DataFrame({"Source table": ["Scheduler"], "Source column": ["ID"], "Target table": ["Scheduler"], "Target column": ["ID"]}).to_excel(writer, index=False, sheet_name="Scheduler")
+
+            with patch("scripts.run_initial_etl.PROJECT_ROOT", project_dir):
+                sheet = run_initial_etl._find_mapping_sheet(str(wrong_workbook), "Scheduler")
+
+            self.assertEqual(sheet, "Scheduler")
+
     def test_snowflake_audit_logger_creates_table_and_records_events(self):
         connection = Mock()
         cursor = Mock()

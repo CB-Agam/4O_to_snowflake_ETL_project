@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import tempfile
 from collections.abc import Callable
 from datetime import date, datetime, time
@@ -17,6 +18,18 @@ from etl.ddl import build_create_table_sql
 logger = logging.getLogger(__name__)
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
 _CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
+
+
+def _snowflake_local_file_uri(path: Path) -> str:
+    resolved = path.resolve()
+    if os.name == "nt":
+        raw_path = str(resolved).replace("\\", "/")
+        if raw_path.startswith("//"):
+            return "file:" + raw_path
+        if raw_path.startswith("/"):
+            return "file://" + raw_path.lstrip("/")
+        return "file://" + raw_path
+    return resolved.as_uri()
 
 
 def _json_value(value: Any) -> Any:
@@ -40,7 +53,7 @@ def _copy_staged_json_file(
     file_path: Path,
     expected_rows: int,
 ) -> int:
-    file_uri = file_path.resolve().as_uri().replace("'", "''")
+    file_uri = _snowflake_local_file_uri(file_path).replace("'", "''")
     snowflake_cursor.execute(
         f"PUT '{file_uri}' @{stage} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
     )

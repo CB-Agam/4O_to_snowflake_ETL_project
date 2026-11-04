@@ -416,22 +416,46 @@ def _positive_int(value: str) -> int:
     return size
 
 
+def _candidate_excel_paths(excel_path: str) -> list[Path]:
+    paths: list[Path] = []
+    requested = Path(excel_path)
+    if requested.exists():
+        paths.append(requested)
+    root = PROJECT_ROOT
+    for candidate in sorted({requested.parent, root}, key=lambda p: str(p)):
+        if not candidate.exists():
+            continue
+        for match in sorted(candidate.glob("*.xlsx"), key=lambda p: str(p)) + sorted(candidate.glob("*.xlsm"), key=lambda p: str(p)):
+            if match not in paths:
+                paths.append(match)
+    return paths
+
+
 def _find_mapping_sheet(excel_path: str, target_table: str) -> str:
     normalized_table = _normalize_target_table_name(target_table)
-    sheet_name = next(
-        (
-            name
-            for name in pd.ExcelFile(excel_path).sheet_names
-            if _normalize_target_table_name(name) == normalized_table
-        ),
-        None,
-    )
-    if sheet_name is None:
-        raise ValueError(
-            f"No worksheet matching target table {normalized_table!r} was found. "
-            "Specify the mapping worksheet with --sheet."
+    seen: set[Path] = set()
+    for workbook_path in _candidate_excel_paths(excel_path):
+        if workbook_path in seen:
+            continue
+        seen.add(workbook_path)
+        try:
+            workbook = pd.ExcelFile(workbook_path)
+        except Exception:
+            continue
+        sheet_name = next(
+            (
+                name
+                for name in workbook.sheet_names
+                if _normalize_target_table_name(name) == normalized_table
+            ),
+            None,
         )
-    return sheet_name
+        if sheet_name is not None:
+            return sheet_name
+    raise ValueError(
+        f"No worksheet matching target table {normalized_table!r} was found in workbook {excel_path!r}. "
+        "Specify the mapping worksheet with --sheet or select the correct mapping workbook with --excel."
+    )
 
 
 def main() -> int:

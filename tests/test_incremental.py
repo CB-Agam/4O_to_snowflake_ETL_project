@@ -178,6 +178,32 @@ class IncrementalStrategyTests(unittest.TestCase):
             row["constraint"] = ""
         self.assertEqual(incremental.select_change_strategy(rows)["strategy"], "ROW_HASH")
 
+    def test_duplicate_key_in_timestamp_mode_falls_back_to_row_hash_state(self):
+        rows = _claim_mapping()
+        data = pd.DataFrame(
+            {
+                "CLAIM_ID": [10, 10],
+                "MODIFIED_ON": [
+                    datetime(2025, 1, 1, 10, 0),
+                    datetime(2025, 1, 2, 10, 0),
+                ],
+                "AMOUNT": [15, 25],
+            }
+        )
+
+        state = incremental._rows_as_state(
+            data,
+            "CLAIMS",
+            ["CLAIM_ID", "MODIFIED_ON", "AMOUNT"],
+            incremental.select_change_strategy(rows),
+        )
+
+        self.assertEqual(len(state), 2)
+        self.assertEqual(state[0][0], "CLAIMS")
+        self.assertIn(":1", state[0][1])
+        self.assertIn(":1", state[1][1])
+        self.assertEqual([item[3] for item in state], [datetime(2025, 1, 1, 10, 0), datetime(2025, 1, 2, 10, 0)])
+
     @patch("etl.incremental.pd.read_sql")
     def test_row_hash_fallback_preserves_duplicate_record_multiplicity(self, read_sql):
         duplicate = ("same", 5)

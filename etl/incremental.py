@@ -230,6 +230,41 @@ def _source_projection_query(source_table: str, columns: Sequence[str]) -> str:
     return build_source_query(source_table, columns)
 
 
+def _hash_state_rows(
+    dataframe: pd.DataFrame,
+    table_name: str,
+    target_columns: Sequence[str],
+    timestamp_column: str | None = None,
+    created_column: str | None = None,
+) -> list[tuple[str, str, str | None, datetime | None, datetime | None]]:
+    state: list[tuple[str, str, str | None, datetime | None, datetime | None]] = []
+    occurrence_counts: Counter[str] = Counter()
+    for record in dataframe.itertuples(index=False, name=None):
+        values = dict(zip(target_columns, record, strict=True))
+        row_hash = _row_hash(record)
+        occurrence_counts[row_hash] += 1
+        modified_at = (
+            _normalize_optional_timestamp(values[timestamp_column], timestamp_column)
+            if timestamp_column
+            else None
+        )
+        created_at = (
+            _normalize_optional_timestamp(values[created_column], created_column)
+            if created_column
+            else None
+        )
+        state.append(
+            (
+                table_name,
+                f"{row_hash}:{occurrence_counts[row_hash]}",
+                row_hash,
+                modified_at,
+                created_at,
+            )
+        )
+    return state
+
+
 def _rows_as_state(
     dataframe: pd.DataFrame,
     table_name: str,
@@ -246,8 +281,17 @@ def _rows_as_state(
             values = dict(zip(target_columns, record, strict=True))
             key = _source_key(values[key_column])
             if key in keys:
-                raise ValueError(
-                    f"Declared key {key_column!r} is not unique in source table {table_name}"
+                logger.warning(
+                    "Source key %r is not unique in %s; falling back to duplicate-safe row-hash state.",
+                    key_column,
+                    table_name,
+                )
+                return _hash_state_rows(
+                    dataframe,
+                    table_name,
+                    target_columns,
+                    timestamp_column,
+                    created_column,
                 )
             keys.add(key)
             modified_at = _normalize_optional_timestamp(
@@ -269,28 +313,17 @@ def _rows_as_state(
             values = dict(zip(target_columns, record, strict=True))
             key = _natural_key_hash(tuple(values[column] for column in key_columns))
             if key in keys:
-                raise ValueError(
-                    f"Declared key columns {key_columns!r} are not unique "
-                    f"in source table {table_name}"
+                logger.warning(
+                    "Declared key columns %r are not unique in %s; falling back to duplicate-safe row-hash state.",
+                    key_columns,
+                    table_name,
                 )
+                return _hash_state_rows(dataframe, table_name, target_columns)
             keys.add(key)
             state.append((table_name, key, _row_hash(record), None, None))
         return state
 
-    occurrence_counts: Counter[str] = Counter()
-    for record in dataframe.itertuples(index=False, name=None):
-        row_hash = _row_hash(record)
-        occurrence_counts[row_hash] += 1
-        state.append(
-            (
-                table_name,
-                f"{row_hash}:{occurrence_counts[row_hash]}",
-                row_hash,
-                None,
-                None,
-            )
-        )
-    return state
+    return _hash_state_rows(dataframe, table_name, target_columns)
 
 
 def _timestamp_watermark(
@@ -488,8 +521,24 @@ def _discover_timestamp_changes(
     for row_index, raw_key in enumerate(source_key_values):
         key = _source_key(raw_key)
         if key in keyed_timestamps:
-            raise ValueError(
-                f"Declared 4D key {key_source!r} is not unique in source table {source_table}"
+            logger.warning(
+                "Declared 4D key %r is not unique in source table %s; falling back to duplicate-safe row-hash incremental state.",
+                key_source,
+                source_table,
+            )
+            changed_df, new_state, source_count, deleted_count = _discover_hash_changes(
+                fourd_connection,
+                table_name,
+                rows,
+                state_by_key,
+            )
+            return (
+                changed_df,
+                new_state,
+                source_count,
+                0,
+                0,
+                deleted_count,
             )
         if created_source:
             created_raw = timestamp_values[0][row_index]
@@ -700,9 +749,24 @@ def _discover_key_hash_changes(
             tuple(values[column] for column in key_target_columns)
         )
         if nk_hash in keyed_rows:
-            raise ValueError(
-                f"Declared primary key columns {key_target_columns!r} are not unique "
-                f"in source table {source_table}"
+            logger.warning(
+                "Declared primary key columns %r are not unique in source table %s; falling back to duplicate-safe row-hash state.",
+                key_target_columns,
+                source_table,
+            )
+            changed_df, new_state, source_count, deleted_count = _discover_hash_changes(
+                fourd_connection,
+                table_name,
+                rows,
+                old_state,
+            )
+            return (
+                changed_df,
+                new_state,
+                source_count,
+                0,
+                0,
+                deleted_count,
             )
         hash_diff = _row_hash(record)
         keyed_rows.add(nk_hash)
@@ -1151,9 +1215,17 @@ def incremental_load_table(
                 )
                 key_values = [_source_key(value) for value in initial_df[strategy["key_target_column"]]]
                 if len(key_values) != len(set(key_values)):
-                    raise ValueError(
-                        f"Declared primary key {strategy['key_target_column']!r} "
-                        f"is not unique in source table {next(iter(source_tables))}"
+                    logger.warning(
+                        "Declared primary key %r is not unique in source table %s; falling back to duplicate-safe row-hash state.",
+                        strategy["key_target_column"],
+                        next(iter(source_tables)),
+                    )
+                    new_state = _hash_state_rows(
+                        initial_df,
+                        table_name,
+                        source_target_columns,
+                        strategy["modified_target_column"],
+                        strategy["created_target_column"],
                     )
             changed_df = initial_df
             counts["source_scan"] = len(initial_df)

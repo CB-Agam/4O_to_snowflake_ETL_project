@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -26,6 +27,18 @@ def _quote_identifier(identifier: str) -> str:
     if not _IDENTIFIER_PATTERN.fullmatch(identifier):
         raise ValueError(f"Unsupported Snowflake identifier: {identifier!r}")
     return f'"{identifier}"'
+
+
+def _snowflake_local_file_uri(path: Path) -> str:
+    resolved = path.resolve()
+    if os.name == "nt":
+        raw_path = str(resolved).replace("\\", "/")
+        if raw_path.startswith("//"):
+            return "file:" + raw_path
+        if raw_path.startswith("/"):
+            return "file://" + raw_path.lstrip("/")
+        return "file://" + raw_path
+    return resolved.as_uri()
 
 
 def _json_default(value: Any) -> str:
@@ -180,7 +193,7 @@ def publish_json_snapshot(
                 f"JSON mapping produced {transformed_rows} row(s), but 4D extraction produced {expected_rows}"
             )
 
-        source_uri = transformed_path.resolve().as_uri().replace("'", "''")
+        source_uri = _snowflake_local_file_uri(transformed_path).replace("'", "''")
         cursor.execute(
             f"PUT '{source_uri}' @{stage_name} "
             "AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
