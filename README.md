@@ -96,16 +96,6 @@ global `S_NO` column. The Snowflake log records steps after Snowflake is
 connected and the log table is available; earlier failures are retained in the
 local file log.
 
-The runner also creates or reuses
-`<SNOWFLAKE_DATABASE>.<SNOWFLAKE_SCHEMA>.ETL_EXCEPTION_LOG`. Bulk loads first
-try each staged batch as a whole; when Snowflake reports row-level conversion
-or insertion errors, the loader splits only the failing subset until it
-isolates each rejected row. Successful rows continue loading. Exception rows
-are stored as JSON in `RECORD_DATA` with error details and source/target row
-context; errors writing this log fail the load explicitly. Pipeline/table
-status is `SUCCESS_WITH_ERRORS` if any rows were rejected. The Snowflake role
-needs permission to create and write the exception log table.
-
 For mapped source columns with 4D type `CLOB`, the initial ETL widens bounded
 Snowflake `VARCHAR(n)` targets to unbounded `VARCHAR` in new table definitions
 and alters existing target columns before loading. The Snowflake role must

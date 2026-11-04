@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import logging
 import json
-import re
 import tempfile
 from collections.abc import Callable
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
@@ -14,370 +13,10 @@ from uuid import UUID, uuid4
 import pandas as pd
 
 from etl.ddl import build_create_table_sql
-from etl.exception_log import SnowflakeExceptionLogger
 
 logger = logging.getLogger(__name__)
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
 _CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
-
-
-class RowLoadError(RuntimeError):
-    """A bulk COPY completed with source-row errors."""
-
-
-def _is_row_level_error(error: BaseException) -> bool:
-    if isinstance(error, RowLoadError):
-        return True
-    message = str(error)
-    if isinstance(error, (ValueError, OverflowError)) and re.search(
-        r"\b(?:year \d+ is out of range|"
-        r"(?:date|time|timestamp).*(?:invalid|out of range|overflow)|"
-        r"(?:invalid|out of range|overflow).*(?:date|time|timestamp|numeric)|"
-        r"could not convert (?:string|value)|"
-        r"invalid literal for (?:int|float)|"
-        r"numeric value .* out of range)\b",
-        message,
-        re.IGNORECASE,
-    ):
-        return True
-    sqlstate_values = [str(getattr(error, "sqlstate", "") or "")]
-    sqlstate_values.extend(str(argument) for argument in getattr(error, "args", ()))
-    sqlstates = {
-        state
-        for value in sqlstate_values
-        for state in re.findall(r"(?<![A-Z0-9])[0-9A-Z]{5}(?![A-Z0-9])", value.upper())
-    }
-    if any(state.startswith(("22", "23")) for state in sqlstates):
-        return True
-    return getattr(error, "errno", None) in {
-        100038,
-        100039,
-        100040,
-        100071,
-        100072,
-    }
-
-
-def _log_row_failure(
-    exception_logger: SnowflakeExceptionLogger | None,
-    *,
-    pipeline_name: str,
-    source_table: str,
-    target_table: str,
-    row_number: int,
-    record: dict[str, Any],
-    error: BaseException,
-    batch_id: str,
-    pipeline_run_id: str | None,
-) -> Exception | None:
-    if exception_logger is None:
-        log_error = RuntimeError(
-            "A row failed but no ETL_EXCEPTION_LOG writer was configured"
-        )
-        logger.error(
-            "%s: source=%s target=%s row=%s data=%r error=%s: %s",
-            log_error,
-            source_table,
-            target_table,
-            row_number,
-            record,
-            type(error).__name__,
-            error,
-            exc_info=(type(error), error, error.__traceback__),
-        )
-        return log_error
-    try:
-        exception_logger.log_row_failure(
-            pipeline_name=pipeline_name,
-            source_table=source_table,
-            target_table=target_table,
-            row_number=row_number,
-            record=record,
-            error=error,
-            batch_id=batch_id,
-            pipeline_run_id=pipeline_run_id,
-        )
-    except Exception as log_error:
-        logger.exception(
-            "Could not log failed source row %s from %s to %s; continuing the load",
-            row_number,
-            source_table,
-            target_table,
-        )
-        logger.error(
-            "Unlogged row failure details: row=%s data=%r error=%s: %s",
-            row_number,
-            record,
-            type(error).__name__,
-            error,
-        )
-        return log_error
-    return None
-
-
-def _quote_4d_identifier(identifier: str) -> str:
-    return "[" + identifier.replace("]", "]]") + "]"
-
-
-def source_primary_key_column(metadata_rows: Sequence[dict[str, str]]) -> str | None:
-    key_columns = [
-        row["source_column"].strip()
-        for row in metadata_rows
-        if row.get("source_column", "").strip()
-        and not re.search(
-            r"\b(?:NO|NONE|NOT|WITHOUT)\s+(?:A\s+)?(?:PK|PRIMARY\s+KEY)\b",
-            row.get("constraint", ""),
-            re.IGNORECASE,
-        )
-        and re.search(
-            r"(^|[^A-Za-z0-9])(?:PK|PRIMARY\s+KEY)([^A-Za-z0-9]|$)",
-            row.get("constraint", ""),
-            re.IGNORECASE,
-        )
-    ]
-    return key_columns[0] if len(key_columns) == 1 else None
-
-
-def _source_key_token(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def _source_row_diagnostic(
-    fourd_connection,
-    source_table: str,
-    metadata_rows: Sequence[dict[str, str]],
-    key_column: str,
-    key_value: Any,
-    error: Exception,
-) -> dict[str, Any]:
-    temporal_types = {
-        "DATE",
-        "DATETIME",
-        "DATETIME2",
-        "TIME",
-        "TIMESTAMP",
-        "INTERVAL",
-    }
-    mapped_rows = [
-        row for row in metadata_rows
-        if row.get("source_column", "").strip()
-        and row.get("target_column", "").strip()
-    ]
-    readable_rows = [
-        row for row in mapped_rows
-        if row.get("source_data_type", "").strip().upper().split("(", 1)[0]
-        not in temporal_types
-    ]
-    record: dict[str, Any] = {
-        row["target_column"].strip(): {
-            "__unavailable__": "ODBC conversion failed while reading this temporal field",
-            "error": str(error),
-        }
-        for row in mapped_rows
-        if row.get("source_data_type", "").strip().upper().split("(", 1)[0]
-        in temporal_types
-    }
-    try:
-        cursor = fourd_connection.cursor()
-        try:
-            if readable_rows:
-                columns = ", ".join(
-                    _quote_4d_identifier(row["source_column"].strip())
-                    for row in readable_rows
-                )
-                cursor.execute(
-                    f"SELECT {columns} FROM {_quote_4d_identifier(source_table)} "
-                    f"WHERE {_quote_4d_identifier(key_column)} = ?",
-                    (key_value,),
-                )
-                row_values = cursor.fetchone()
-                if row_values is not None:
-                    record.update(
-                        {
-                            mapping["target_column"].strip(): value
-                            for mapping, value in zip(
-                                readable_rows,
-                                row_values,
-                                strict=True,
-                            )
-                        }
-                    )
-        finally:
-            cursor.close()
-    except Exception:
-        logger.exception(
-            "Could not retrieve non-temporal diagnostic values for %s key %r",
-            source_table,
-            key_value,
-        )
-    key_mapping = next(
-        (
-            row for row in mapped_rows
-            if row.get("source_column", "").strip().casefold()
-            == key_column.casefold()
-        ),
-        None,
-    )
-    record[
-        key_mapping["target_column"].strip() if key_mapping else key_column
-    ] = key_value
-    record["__source_extraction_error__"] = str(error)
-    return record
-
-
-def iter_source_batches_with_row_isolation(
-    source_connection,
-    query: str,
-    *,
-    source_table: str,
-    source_columns: Sequence[str],
-    target_columns: Sequence[str],
-    metadata_rows: Sequence[dict[str, str]],
-    key_column: str | None,
-    batch_size: int,
-    on_row_failure: Callable[[int, dict[str, Any], Exception], None],
-    recovery_keys: Sequence[Any] | None = None,
-    query_params: Sequence[Any] = (),
-):
-    """Stream source batches and retry data-conversion failures by declared key."""
-    if len(source_columns) != len(target_columns):
-        raise ValueError(
-            f"Source column count ({len(source_columns)}) does not match target "
-            f"column count ({len(target_columns)}) for {source_table}"
-        )
-    source_cursor = source_connection.cursor()
-    seen_keys: set[str] = set()
-    key_index = (
-        next(
-            (
-                index for index, column in enumerate(source_columns)
-                if column.casefold() == key_column.casefold()
-            ),
-            None,
-        )
-        if key_column
-        else None
-    )
-
-    def remember_keys(rows) -> None:
-        if key_index is not None:
-            seen_keys.update(_source_key_token(row[key_index]) for row in rows)
-
-    def fetch_key_group(
-        cursor,
-        keys: Sequence[tuple[int, Any]],
-        quoted_columns: str,
-    ):
-        keys = [
-            item for item in keys
-            if _source_key_token(item[1]) not in seen_keys
-        ]
-        if not keys:
-            return
-        where_clause = " OR ".join(
-            f"{_quote_4d_identifier(key_column)} = ?" for _ in keys
-        )
-        try:
-            cursor.execute(
-                f"SELECT {quoted_columns} FROM {_quote_4d_identifier(source_table)} "
-                f"WHERE {where_clause}",
-                [key for _, key in keys],
-            )
-            while True:
-                group_rows = cursor.fetchmany(min(batch_size, len(keys)))
-                if not group_rows:
-                    break
-                remember_keys(group_rows)
-                yield group_rows
-        except Exception as exc:
-            if not _is_row_level_error(exc):
-                raise
-            if len(keys) > 1:
-                middle = len(keys) // 2
-                yield from fetch_key_group(cursor, keys[:middle], quoted_columns)
-                yield from fetch_key_group(cursor, keys[middle:], quoted_columns)
-                return
-            row_number, key_value = keys[0]
-            diagnostic = _source_row_diagnostic(
-                source_connection,
-                source_table,
-                metadata_rows,
-                key_column,
-                key_value,
-                exc,
-            )
-            on_row_failure(row_number, diagnostic, exc)
-
-    try:
-        if query_params:
-            source_cursor.execute(query, list(query_params))
-        else:
-            source_cursor.execute(query)
-        while True:
-            try:
-                rows = source_cursor.fetchmany(batch_size)
-            except Exception as exc:
-                if not _is_row_level_error(exc):
-                    raise
-                if key_index is None or key_column is None:
-                    raise RuntimeError(
-                        f"4D returned a row-conversion error while reading "
-                        f"{source_table}, but the mapping has no single declared "
-                        "key to isolate the offending record"
-                    ) from exc
-                logger.warning(
-                    "4D row conversion failed while fetching %s; retrying source rows "
-                    "by key to isolate the invalid record",
-                    source_table,
-                    exc_info=True,
-                )
-                source_cursor.close()
-                source_cursor = source_connection.cursor()
-                if recovery_keys is None:
-                    key_cursor = source_connection.cursor()
-                    try:
-                        key_cursor.execute(
-                            f"SELECT {_quote_4d_identifier(key_column)} "
-                            f"FROM {_quote_4d_identifier(source_table)}"
-                        )
-                        all_keys = []
-                        while True:
-                            key_rows = key_cursor.fetchmany(batch_size)
-                            if not key_rows:
-                                break
-                            all_keys.extend(row[0] for row in key_rows)
-                    finally:
-                        key_cursor.close()
-                else:
-                    all_keys = list(recovery_keys)
-                key_tokens = [_source_key_token(value) for value in all_keys]
-                if len(key_tokens) != len(set(key_tokens)):
-                    raise RuntimeError(
-                        f"Declared source key {key_column!r} is not unique in "
-                        f"source table {source_table}; row-level fetch recovery "
-                        "cannot safely continue"
-                    )
-                pending_keys = [
-                    (index + 1, value)
-                    for index, value in enumerate(all_keys)
-                    if _source_key_token(value) not in seen_keys
-                ]
-                quoted_columns = ", ".join(
-                    _quote_4d_identifier(column) for column in source_columns
-                )
-                for start in range(0, len(pending_keys), batch_size):
-                    yield from fetch_key_group(
-                        source_cursor,
-                        pending_keys[start : start + batch_size],
-                        quoted_columns,
-                    )
-                return
-            if not rows:
-                return
-            remember_keys(rows)
-            yield rows
-    finally:
-        source_cursor.close()
 
 
 def _json_value(value: Any) -> Any:
@@ -438,16 +77,7 @@ def _copy_staged_json_file(
     loaded_rows = sum(int(row[loaded_index] or 0) for row in copy_rows)
     errors = sum(int(row[errors_index] or 0) for row in copy_rows) if errors_index is not None else 0
     if errors:
-        detail_index = copy_columns.index("first_error") if "first_error" in copy_columns else None
-        detail = (
-            "; ".join(str(row[detail_index]) for row in copy_rows if row[detail_index])
-            if detail_index is not None
-            else ""
-        )
-        message = f"Snowflake COPY INTO reported {errors} load error(s)"
-        if detail:
-            message = f"{message}: {detail}"
-        raise RowLoadError(message)
+        raise RuntimeError(f"Snowflake COPY INTO reported {errors} load error(s)")
     if loaded_rows != expected_rows:
         raise RuntimeError(
             f"Snowflake copied {loaded_rows} of {expected_rows} "
@@ -533,102 +163,6 @@ def load_dataframe_to_snowflake(
     return len(rows)
 
 
-def load_dataframe_to_snowflake_with_exceptions(
-    snowflake_connection,
-    snowflake_cursor,
-    table_name: str,
-    target_columns: Sequence[str],
-    df: pd.DataFrame,
-    *,
-    exception_logger: SnowflakeExceptionLogger,
-    pipeline_name: str,
-    source_table: str,
-    batch_id: str,
-    pipeline_run_id: str | None = None,
-    first_row_number: int = 1,
-    schema_name: str | None = None,
-    target_table_name: str | None = None,
-) -> dict[str, Any]:
-    if df.empty:
-        return {
-            "rows_loaded": 0,
-            "rows_failed": 0,
-            "failed_indexes": [],
-            "exception_log_count": 0,
-            "exception_log_failures": 0,
-            "exception_log_errors": [],
-        }
-
-    ordered_columns = [
-        column
-        for column in target_columns
-        if column.upper() not in _ETL_TIMESTAMP_COLUMNS
-    ]
-    ordered_df = df.loc[:, ordered_columns]
-    rows = [
-        tuple(_clean_value(value) for value in row)
-        for row in ordered_df.itertuples(index=False, name=None)
-    ]
-    records = [
-        dict(zip(ordered_columns, row, strict=True))
-        for row in rows
-    ]
-    sql = build_insert_sql(table_name, ordered_columns, schema_name=schema_name)
-    failed_indexes: list[int] = []
-    exception_log_errors: list[str] = []
-
-    def insert_with_isolation(indexes: list[int]) -> None:
-        if not indexes:
-            return
-        try:
-            snowflake_cursor.execute("BEGIN")
-            snowflake_cursor.executemany(sql, [rows[index] for index in indexes])
-            snowflake_cursor.execute("COMMIT")
-        except BaseException as exc:
-            try:
-                snowflake_connection.rollback()
-            except Exception:
-                logger.exception("Could not roll back staged row batch for %s", table_name)
-                raise
-            if not isinstance(exc, Exception):
-                raise
-            if not _is_row_level_error(exc):
-                raise
-            if len(indexes) > 1:
-                middle = len(indexes) // 2
-                insert_with_isolation(indexes[:middle])
-                insert_with_isolation(indexes[middle:])
-                return
-            index = indexes[0]
-            row_number = first_row_number + index
-            log_error = _log_row_failure(
-                exception_logger,
-                pipeline_name=pipeline_name,
-                source_table=source_table,
-                target_table=target_table_name or table_name,
-                row_number=row_number,
-                record=records[index],
-                error=exc,
-                batch_id=batch_id,
-                pipeline_run_id=pipeline_run_id,
-            )
-            if log_error is not None:
-                exception_log_errors.append(
-                    f"row {row_number}: {type(log_error).__name__}: {log_error}"
-                )
-            failed_indexes.append(index)
-
-    insert_with_isolation(list(range(len(rows))))
-    return {
-        "rows_loaded": len(rows) - len(failed_indexes),
-        "rows_failed": len(failed_indexes),
-        "failed_indexes": failed_indexes,
-        "exception_log_count": len(failed_indexes) - len(exception_log_errors),
-        "exception_log_failures": len(exception_log_errors),
-        "exception_log_errors": exception_log_errors,
-    }
-
-
 def load_query_to_snowflake_in_batches(
     source_connection,
     snowflake_connection,
@@ -640,22 +174,10 @@ def load_query_to_snowflake_in_batches(
     target_columns: Sequence[str],
     batch_size: int = 50_000,
     before_publish: Callable[[], None] | None = None,
-    exception_logger: SnowflakeExceptionLogger | None = None,
-    source_table: str | None = None,
-    source_columns: Sequence[str] | None = None,
-    metadata_rows: Sequence[dict[str, str]] = (),
-    source_key_column: str | None = None,
-    pipeline_name: str = "4D_TO_SNOWFLAKE_ETL",
-    batch_id: str | None = None,
-    pipeline_run_id: str | None = None,
-    return_stats: bool = False,
-) -> int | dict[str, Any]:
+) -> int:
     if batch_size <= 0:
         raise ValueError("Batch size must be greater than zero")
 
-    load_started = datetime.now(timezone.utc)
-    batch_id = batch_id or str(uuid4())
-    source_table = source_table or table_name
     source_target_columns = [
         column
         for column in target_columns
@@ -679,21 +201,13 @@ def load_query_to_snowflake_in_batches(
     stage = qualify(database_name, schema_name, stage_name)
     stage_table_name = f"ETL_LOAD_{uuid4().hex[:24].upper()}"
     stage_table = qualify(database_name, schema_name, stage_table_name)
-    stage_row_number_name = f"__ETL_ROW_NUMBER_{uuid4().hex[:8].upper()}"
     columns_sql = ", ".join(quote_identifier(column) for column in source_target_columns)
     created_timestamp = quote_identifier("CREATED_TIMESTAMP")
     updated_timestamp = quote_identifier("UPDATED_TIMESTAMP")
-    stage_row_number = quote_identifier(stage_row_number_name)
     stage_created = False
-    stage_object_created = False
     operation_error: BaseException | None = None
+    transaction_started = False
     total_staged = 0
-    total_processed = 0
-    total_published = 0
-    failed_row_count = 0
-    exception_log_errors: list[str] = []
-    copy_attempt = 0
-    extraction_failed_count = 0
 
     try:
         snowflake_cursor.execute(
@@ -702,171 +216,61 @@ def load_query_to_snowflake_in_batches(
         )
         stage_created = True
         snowflake_cursor.execute(
-            f"ALTER TABLE {stage_table} ADD COLUMN {stage_row_number} NUMBER(38, 0)"
-        )
-        snowflake_cursor.execute(
             f"CREATE TEMPORARY STAGE {stage} "
             "FILE_FORMAT=(TYPE='JSON' STRIP_OUTER_ARRAY=TRUE)"
         )
-        stage_object_created = True
 
-        if source_columns is None:
-            source_columns = source_target_columns
-
-        def log_extraction_failure(
-            row_number: int,
-            record: dict[str, Any],
-            error: Exception,
-        ) -> None:
-            nonlocal failed_row_count, extraction_failed_count
-            failed_row_count += 1
-            extraction_failed_count += 1
-            log_error = _log_row_failure(
-                exception_logger,
-                pipeline_name=pipeline_name,
-                source_table=source_table,
-                target_table=table_name,
-                row_number=row_number,
-                record=record,
-                error=error,
-                batch_id=batch_id,
-                pipeline_run_id=pipeline_run_id,
-            )
-            if log_error is not None:
-                exception_log_errors.append(
-                    f"row {row_number}: {type(log_error).__name__}: {log_error}"
-                )
-
-        batch_number = 0
-        source_batches = iter_source_batches_with_row_isolation(
-            source_connection,
-            query,
-            source_table=source_table,
-            source_columns=source_columns,
-            target_columns=target_columns,
-            metadata_rows=metadata_rows,
-            key_column=source_key_column,
-            batch_size=batch_size,
-            on_row_failure=log_extraction_failure,
-        )
+        source_cursor = source_connection.cursor()
         try:
-            for rows in source_batches:
+            source_cursor.execute(query)
+            batch_number = 0
+            while True:
+                rows = source_cursor.fetchmany(batch_size)
+                if not rows:
+                    break
                 batch_number += 1
-                batch_items: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
-                for row in rows:
-                    total_processed += 1
-                    row_number = total_processed
-                    if len(row) != len(target_columns):
-                        raise ValueError(
-                            f"Source batch {batch_number} returned "
-                            f"{len(row)} column(s); expected "
-                            f"{len(target_columns)} for {table_name}"
-                        )
-                    record = {
-                        column: _clean_value(value)
-                        for column, value in zip(target_columns, row, strict=True)
-                        if column.upper() not in _ETL_TIMESTAMP_COLUMNS
-                    }
-                    try:
-                        json_record = {
-                            column: _json_value(value)
-                            for column, value in record.items()
-                        }
-                        json.dumps(
-                            json_record,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                            default=_json_value,
-                        )
-                    except (TypeError, ValueError) as exc:
-                        failed_row_count += 1
-                        log_error = _log_row_failure(
-                            exception_logger,
-                            pipeline_name=pipeline_name,
-                            source_table=source_table,
-                            target_table=table_name,
-                            row_number=row_number,
-                            record=record,
-                            error=exc,
-                            batch_id=batch_id,
-                            pipeline_run_id=pipeline_run_id,
-                        )
-                        if log_error is not None:
-                            exception_log_errors.append(
-                                f"row {row_number}: "
-                                f"{type(log_error).__name__}: {log_error}"
-                            )
-                    else:
-                        batch_items.append((row_number, record, json_record))
-
-                def copy_with_isolation(
-                    items: list[tuple[int, dict[str, Any], dict[str, Any]]],
-                ) -> int:
-                    nonlocal copy_attempt, failed_row_count
-                    if not items:
-                        return 0
-                    copy_attempt += 1
-                    attempt_name = f"{stage_name}_{batch_number}_{copy_attempt}.json"
-                    with tempfile.TemporaryDirectory(
-                        prefix=f"{stage_name}_{batch_number}_{copy_attempt}_"
-                    ) as temp_dir:
-                        file_path = Path(temp_dir) / attempt_name
-                        with file_path.open("w", encoding="utf-8", newline="") as output:
+                staged_filename = f"{stage_name}_{batch_number}.json"
+                with tempfile.TemporaryDirectory(
+                    prefix=f"{stage_name}_{batch_number}_"
+                ) as temp_dir:
+                    file_path = Path(temp_dir) / staged_filename
+                    with file_path.open("w", encoding="utf-8", newline="") as output:
+                        output.write("[")
+                        for row_index, row in enumerate(rows):
+                            if len(row) != len(target_columns):
+                                raise ValueError(
+                                    f"Source batch {batch_number} returned "
+                                    f"{len(row)} column(s); expected "
+                                    f"{len(target_columns)} for {table_name}"
+                                )
+                            if row_index:
+                                output.write(",")
+                            record = {
+                                column: _json_value(value)
+                                for column, value in zip(
+                                    target_columns,
+                                    row,
+                                    strict=True,
+                                )
+                                if column.upper() not in _ETL_TIMESTAMP_COLUMNS
+                            }
                             json.dump(
-                                [
-                                    {**item[2], stage_row_number_name: item[0]}
-                                    for item in items
-                                ],
+                                record,
                                 output,
                                 ensure_ascii=False,
                                 separators=(",", ":"),
                                 allow_nan=False,
                                 default=_json_value,
                             )
-                        try:
-                            loaded = _copy_staged_json_file(
-                                snowflake_cursor,
-                                stage,
-                                stage_table,
-                                attempt_name,
-                                file_path,
-                                len(items),
-                            )
-                        except RowLoadError as exc:
-                            snowflake_cursor.execute(
-                                f"DELETE FROM {stage_table} WHERE {stage_row_number} "
-                                "BETWEEN %s AND %s",
-                                (items[0][0], items[-1][0]),
-                            )
-                            if len(items) == 1:
-                                row_number, record, _ = items[0]
-                                log_error = _log_row_failure(
-                                    exception_logger,
-                                    pipeline_name=pipeline_name,
-                                    source_table=source_table,
-                                    target_table=table_name,
-                                    row_number=row_number,
-                                    record=record,
-                                    error=exc,
-                                    batch_id=batch_id,
-                                    pipeline_run_id=pipeline_run_id,
-                                )
-                                if log_error is not None:
-                                    exception_log_errors.append(
-                                        f"row {row_number}: "
-                                        f"{type(log_error).__name__}: {log_error}"
-                                    )
-                                failed_row_count += 1
-                                return 0
-                            middle = len(items) // 2
-                            return (
-                                copy_with_isolation(items[:middle])
-                                + copy_with_isolation(items[middle:])
-                            )
-                    return loaded
-
-                loaded_rows = copy_with_isolation(batch_items)
+                        output.write("]")
+                    loaded_rows = _copy_staged_json_file(
+                        snowflake_cursor,
+                        stage,
+                        stage_table,
+                        staged_filename,
+                        file_path,
+                        len(rows),
+                    )
                 total_staged += loaded_rows
                 logger.info(
                     "Staged batch %s for %s: %s rows (%s total)",
@@ -876,8 +280,7 @@ def load_query_to_snowflake_in_batches(
                     total_staged,
                 )
         finally:
-            source_batches.close()
-        total_processed += extraction_failed_count
+            source_cursor.close()
 
         staged_count = snowflake_cursor.execute(
             f"SELECT COUNT(*) FROM {stage_table}"
@@ -891,146 +294,50 @@ def load_query_to_snowflake_in_batches(
 
         if before_publish is not None:
             before_publish()
-
-        insert_columns = [
-            *[quote_identifier(column) for column in source_target_columns],
-            created_timestamp,
-            updated_timestamp,
-        ]
-        select_columns = [
-            *[quote_identifier(column) for column in source_target_columns],
-            _CURRENT_TIMESTAMP_NTZ,
-            _CURRENT_TIMESTAMP_NTZ,
-        ]
-
-        def publish_with_isolation(first_number: int, last_number: int) -> int:
-            nonlocal total_published, failed_row_count
-            if first_number > last_number:
-                return 0
-            count_result = snowflake_cursor.execute(
-                f"SELECT COUNT(*) FROM {stage_table} WHERE {stage_row_number} "
-                "BETWEEN %s AND %s",
-                (first_number, last_number),
-            ).fetchone()
-            rows_to_publish = int(count_result[0] or 0) if count_result else 0
-            if rows_to_publish == 0:
-                return 0
-            try:
-                snowflake_cursor.execute("BEGIN")
-                snowflake_cursor.execute(
-                    f"INSERT INTO {target} ({', '.join(insert_columns)}) "
-                    f"SELECT {', '.join(select_columns)} FROM {stage_table} "
-                    f"WHERE {stage_row_number} BETWEEN %s AND %s",
-                    (first_number, last_number),
-                )
-                snowflake_cursor.execute("COMMIT")
-            except BaseException as exc:
-                try:
-                    snowflake_connection.rollback()
-                except Exception:
-                    logger.exception(
-                        "Could not roll back target rows for %s",
-                        table_name,
-                    )
-                    raise
-                if not isinstance(exc, Exception):
-                    raise
-                if not _is_row_level_error(exc):
-                    raise
-                if first_number < last_number:
-                    middle = (first_number + last_number) // 2
-                    return (
-                        publish_with_isolation(first_number, middle)
-                        + publish_with_isolation(middle + 1, last_number)
-                    )
-                row_number = first_number
-                record_row = snowflake_cursor.execute(
-                    f"SELECT {columns_sql} FROM {stage_table} "
-                    f"WHERE {stage_row_number} = %s",
-                    (row_number,),
-                ).fetchone()
-                if record_row is None:
-                    raise RuntimeError(
-                        f"Could not retrieve failed source row {row_number} "
-                        f"from staging for {table_name}"
-                    ) from exc
-                log_error = _log_row_failure(
-                    exception_logger,
-                    pipeline_name=pipeline_name,
-                    source_table=source_table,
-                    target_table=table_name,
-                    row_number=row_number,
-                    record=dict(zip(source_target_columns, record_row, strict=True)),
-                    error=exc,
-                    batch_id=batch_id,
-                    pipeline_run_id=pipeline_run_id,
-                )
-                if log_error is not None:
-                    exception_log_errors.append(
-                        f"row {row_number}: "
-                        f"{type(log_error).__name__}: {log_error}"
-                    )
-                failed_row_count += 1
-                return 0
-            total_published += rows_to_publish
-            return rows_to_publish
-
-        if total_processed:
-            publish_with_isolation(1, total_processed)
-        end_time = datetime.now(timezone.utc)
-        if return_stats:
-            status = "SUCCESS_WITH_ERRORS" if failed_row_count else "SUCCESS"
-            return {
-                "source_table": source_table,
-                "target_table": table_name,
-                "rows_processed": total_processed,
-                "rows_loaded": total_published,
-                "rows_failed": failed_row_count,
-                "exception_count": failed_row_count,
-                "exception_log_failures": len(exception_log_errors),
-                "exception_log_errors": exception_log_errors,
-                "total_records_processed": total_processed,
-                "successful_record_count": total_published,
-                "failed_record_count": failed_row_count,
-                "exception_log_count": failed_row_count - len(exception_log_errors),
-                "batch_id": batch_id,
-                "load_started_at": load_started.isoformat(),
-                "load_ended_at": end_time.isoformat(),
-                "status": status,
-                "overall_status": status,
-            }
-        if exception_log_errors:
-            raise RuntimeError(
-                f"{len(exception_log_errors)} failed row(s) in {table_name} "
-                "could not be recorded in ETL_EXCEPTION_LOG after all rows "
-                f"were processed: {'; '.join(exception_log_errors)}"
+        if total_staged:
+            snowflake_cursor.execute("BEGIN")
+            transaction_started = True
+            insert_columns = [
+                *[quote_identifier(column) for column in source_target_columns],
+                created_timestamp,
+                updated_timestamp,
+            ]
+            select_columns = [
+                *[quote_identifier(column) for column in source_target_columns],
+                _CURRENT_TIMESTAMP_NTZ,
+                _CURRENT_TIMESTAMP_NTZ,
+            ]
+            snowflake_cursor.execute(
+                f"INSERT INTO {target} ({', '.join(insert_columns)}) "
+                f"SELECT {', '.join(select_columns)} FROM {stage_table}"
             )
-        return total_published
+            snowflake_cursor.execute("COMMIT")
+            transaction_started = False
+        return total_staged
     except BaseException as exc:
         operation_error = exc
+        if transaction_started:
+            try:
+                snowflake_connection.rollback()
+            except Exception:
+                logger.exception(
+                    "Could not roll back batched load for %s",
+                    table_name,
+                )
         raise
     finally:
-        cleanup_error: Exception | None = None
-        if stage_object_created:
-            try:
-                snowflake_cursor.execute(f"DROP STAGE IF EXISTS {stage}")
-            except Exception as exc:
-                logger.exception("Could not remove temporary stage for %s", table_name)
-                cleanup_error = exc
         if stage_created:
             try:
                 snowflake_cursor.execute(f"DROP TABLE IF EXISTS {stage_table}")
-            except Exception as exc:
+            except Exception as cleanup_error:
                 logger.exception(
                     "Could not remove temporary staging table for %s",
                     table_name,
                 )
-                if cleanup_error is None:
-                    cleanup_error = exc
-        if operation_error is None and cleanup_error is not None:
-            raise RuntimeError(
-                f"Batched load for {table_name} completed with staging cleanup failure"
-            ) from cleanup_error
+                if operation_error is None:
+                    raise RuntimeError(
+                        f"Batched load for {table_name} completed with staging cleanup failure"
+                    ) from cleanup_error
 
 
 def create_missing_tables_from_metadata(cursor, metadata: Dict[str, List[Dict[str, str]]], schema_name: str) -> List[str]:

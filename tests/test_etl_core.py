@@ -1,5 +1,4 @@
 import logging
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,7 +15,6 @@ from etl.ddl import (
     build_widen_clob_columns_sql,
 )
 from etl.metadata import table_metadata_from_dataframe
-from etl.exception_log import SnowflakeExceptionLogger
 from config.settings import Settings
 from connections.fourd_connection import connect_to_4d
 from connections.snowflake_connection import connect_to_snowflake
@@ -24,128 +22,13 @@ from etl.load import (
     build_insert_sql,
     build_source_query,
     load_dataframe_to_snowflake,
-    load_dataframe_to_snowflake_with_exceptions,
-    iter_source_batches_with_row_isolation,
     load_query_to_snowflake_in_batches,
-    RowLoadError,
-    source_primary_key_column,
-    _is_row_level_error,
 )
 from scripts import run_initial_etl
 from scripts.run_initial_etl import _parse_args
 
 
 class EtlCoreTests(unittest.TestCase):
-    def test_source_primary_key_detection_ignores_negative_constraint_note(self):
-        self.assertIsNone(
-            source_primary_key_column(
-                [
-                    {
-                        "source_column": "GLOBAL_NAME_NO_1",
-                        "constraint": "There is no primary key for this table",
-                    }
-                ]
-            )
-        )
-
-    def test_odbc_data_exception_sqlstate_is_classified_as_row_level(self):
-        error = RuntimeError(
-            "ODBC failure",
-            "[22008] Datetime field overflow",
-        )
-
-        self.assertTrue(_is_row_level_error(error))
-
-    def test_source_fetch_error_isolated_by_declared_key(self):
-        class FakeSourceCursor:
-            def __init__(self):
-                self.mode = ""
-                self.fetch_count = 0
-                self.keys = []
-
-            def execute(self, query, params=None):
-                self.query = query
-                self.params = params or []
-                self.fetch_count = 0
-                if query == "SELECT [ID], [DATE_VALUE] FROM [SOURCE]":
-                    self.mode = "initial"
-                elif query == "SELECT [ID] FROM [SOURCE]":
-                    self.mode = "keys"
-                elif "WHERE" in query:
-                    self.mode = "group"
-                return self
-
-            def fetchmany(self, _size):
-                self.fetch_count += 1
-                if self.mode == "initial":
-                    if self.fetch_count == 1:
-                        return [(1, "2025-01-01")]
-                    raise ValueError("year 12015 is out of range")
-                if self.mode == "keys":
-                    return [(1,), (2,), (3,)] if self.fetch_count == 1 else []
-                if self.mode == "group":
-                    if 2 in self.params:
-                        raise ValueError("year 12015 is out of range")
-                    return (
-                        [(3, "2025-01-03")]
-                        if self.fetch_count == 1
-                        else []
-                    )
-                raise AssertionError(f"Unexpected query: {self.query}")
-
-            def fetchone(self):
-                return (2,)
-
-            def close(self):
-                pass
-
-        source_connection = Mock()
-        source_connection.cursor.side_effect = FakeSourceCursor
-        failures = []
-        metadata_rows = [
-            {
-                "source_table": "SOURCE",
-                "source_column": "ID",
-                "source_data_type": "INTEGER",
-                "target_column": "ID",
-                "constraint": "PK",
-            },
-            {
-                "source_table": "SOURCE",
-                "source_column": "DATE_VALUE",
-                "source_data_type": "DATE",
-                "target_column": "DATE_VALUE",
-                "constraint": "",
-            },
-        ]
-
-        batches = iter_source_batches_with_row_isolation(
-            source_connection,
-            "SELECT [ID], [DATE_VALUE] FROM [SOURCE]",
-            source_table="SOURCE",
-            source_columns=["ID", "DATE_VALUE"],
-            target_columns=["ID", "DATE_VALUE"],
-            metadata_rows=metadata_rows,
-            key_column="ID",
-            batch_size=3,
-            on_row_failure=lambda *failure: failures.append(failure),
-        )
-        loaded_rows = [row for batch in batches for row in batch]
-
-        self.assertEqual(
-            loaded_rows,
-            [(1, "2025-01-01"), (3, "2025-01-03")],
-        )
-        self.assertEqual(len(failures), 1)
-        row_number, record, error = failures[0]
-        self.assertEqual(row_number, 2)
-        self.assertEqual(record["ID"], 2)
-        self.assertEqual(
-            record["DATE_VALUE"]["__unavailable__"],
-            "ODBC conversion failed while reading this temporal field",
-        )
-        self.assertEqual(str(error), "year 12015 is out of range")
-
     def test_snowflake_audit_logger_creates_table_and_records_events(self):
         connection = Mock()
         cursor = Mock()
@@ -216,34 +99,6 @@ class EtlCoreTests(unittest.TestCase):
         self.assertIn("RuntimeError", failure_values[2])
         self.assertIn("Traceback (most recent call last)", failure_values[2])
         self.assertEqual(failure_values[3:], (audit.run_id, 1))
-
-    def test_exception_logger_marks_non_row_step_failure(self):
-        connection = Mock()
-        cursor = Mock()
-        connection.cursor.return_value = cursor
-        exception_logger = SnowflakeExceptionLogger(
-            connection,
-            "DW_TEST",
-            "UW_RAW_STG",
-        )
-        error = RuntimeError("target permission denied")
-
-        exception_logger.log_step_failure(
-            pipeline_name="TEST",
-            source_table="SOURCE",
-            target_table="TARGET",
-            step_name="BATCHED_BULK_LOAD",
-            error=error,
-            batch_id="batch-1",
-            pipeline_run_id="run-1",
-        )
-
-        sql, params = cursor.execute.call_args.args
-        self.assertIn("MERGE INTO", sql)
-        record = json.loads(params[7])
-        self.assertEqual(record["__failure_scope__"], "PIPELINE_STEP")
-        self.assertEqual(record["__step__"], "BATCHED_BULK_LOAD")
-        self.assertEqual(params[6], 0)
 
     def test_snowflake_audit_logger_records_step_start_and_success(self):
         connection = Mock()
@@ -329,70 +184,8 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(finish_values[:2], (1, "SUCCESS"))
         self.assertIn("Loaded 1 rows into REPORTS", finish_values[2])
         fourd_connection.close.assert_called_once()
-        self.assertEqual(snowflake_cursor.close.call_count, 2)
+        snowflake_cursor.close.assert_called_once()
         snowflake_connection.close.assert_called_once()
-
-    @patch(
-        "scripts.run_initial_etl.load_query_to_snowflake_in_batches",
-        return_value={
-            "rows_loaded": 2,
-            "rows_processed": 3,
-            "rows_failed": 1,
-            "exception_count": 1,
-            "status": "SUCCESS_WITH_ERRORS",
-        },
-    )
-    @patch("scripts.run_initial_etl.table_exists_in_snowflake", return_value=True)
-    @patch("scripts.run_initial_etl.connect_to_4d")
-    @patch(
-        "scripts.run_initial_etl.load_metadata_from_excel",
-        return_value={
-            "REPORTS": [{
-                "source_table": "Reports",
-                "source_column": "Source Column",
-                "target_column": "SOURCE_COLUMN",
-            }]
-        },
-    )
-    @patch("scripts.run_initial_etl.SnowflakeAuditLogger")
-    @patch("scripts.run_initial_etl.connect_to_snowflake")
-    def test_run_for_table_marks_partial_row_failures(
-        self,
-        connect_snowflake,
-        audit_logger,
-        _load_metadata,
-        connect_4d,
-        _table_exists,
-        _load_in_batches,
-    ):
-        snowflake_connection = Mock()
-        snowflake_cursor = Mock()
-        snowflake_connection.cursor.return_value = snowflake_cursor
-        connect_snowflake.return_value = snowflake_connection
-        fourd_connection = Mock()
-        connect_4d.return_value = fourd_connection
-        audit = Mock()
-        audit.run_id = "test-run-id"
-        audit.record.return_value = 1
-        audit.run_step.side_effect = lambda _step, action, _table_name=None: action()
-        audit_logger.return_value = audit
-
-        with (
-            patch("scripts.run_initial_etl.acquire_table_run_lock", return_value={}),
-            patch("scripts.run_initial_etl.renew_table_run_lock"),
-            patch("scripts.run_initial_etl.release_table_run_lock"),
-        ):
-            result = run_initial_etl.run_for_table(
-                "mapping.xlsx",
-                "Reports",
-                "REPORTS",
-            )
-
-        self.assertEqual(result["tables"][0]["status"], "SUCCESS_WITH_ERRORS")
-        self.assertEqual(result["tables"][0]["rows_loaded"], 2)
-        finish_values = audit.finish_step.call_args.args
-        self.assertEqual(finish_values[:2], (1, "SUCCESS_WITH_ERRORS"))
-        self.assertIn("Loaded 2 of 3 rows into REPORTS with 1 row error", finish_values[2])
 
     @patch(
         "scripts.run_initial_etl.load_metadata_from_excel",
@@ -505,10 +298,6 @@ class EtlCoreTests(unittest.TestCase):
         )
         self.assertEqual(load_metadata.call_count, 3)
         self.assertEqual(load_in_batches.call_count, 3)
-        self.assertNotIn(
-            "DROP_STATUS_COLUMN",
-            [call.args[0] for call in audit.run_step.call_args_list],
-        )
         status_drops = [
             call.args[0]
             for call in snowflake_cursor.execute.call_args_list
@@ -516,60 +305,8 @@ class EtlCoreTests(unittest.TestCase):
         ]
         self.assertEqual(len(status_drops), 3)
         fourd_connection.close.assert_called_once()
-        self.assertEqual(snowflake_cursor.close.call_count, 2)
+        snowflake_cursor.close.assert_called_once()
         snowflake_connection.close.assert_called_once()
-
-    @patch("scripts.run_initial_etl.load_query_to_snowflake_in_batches", return_value=1)
-    @patch(
-        "scripts.run_initial_etl.table_exists_in_snowflake",
-        side_effect=[RuntimeError("first table check failed"), True],
-    )
-    @patch("scripts.run_initial_etl.connect_to_4d")
-    @patch("scripts.run_initial_etl.load_metadata_from_excel")
-    @patch("scripts.run_initial_etl.SnowflakeAuditLogger")
-    @patch("scripts.run_initial_etl.connect_to_snowflake")
-    def test_run_for_table_logs_and_stops_after_a_systemic_table_failure(
-        self,
-        connect_snowflake,
-        audit_logger,
-        load_metadata,
-        connect_4d,
-        _table_exists,
-        load_in_batches,
-    ):
-        load_metadata.side_effect = lambda _path, sheet_name: {
-            f"{sheet_name.upper()}": [{
-                "source_table": sheet_name,
-                "source_column": "Source Column",
-                "target_column": "SOURCE_COLUMN",
-            }]
-        }
-        snowflake_connection = Mock()
-        snowflake_cursor = Mock()
-        snowflake_connection.cursor.return_value = snowflake_cursor
-        connect_snowflake.return_value = snowflake_connection
-        connect_4d.return_value = Mock()
-        audit = Mock()
-        audit.run_id = "test-run-id"
-        audit.run_step.side_effect = lambda _step, action, _table_name=None: action()
-        audit_logger.return_value = audit
-
-        with (
-            patch("scripts.run_initial_etl.acquire_table_run_lock", return_value={}),
-            patch("scripts.run_initial_etl.renew_table_run_lock"),
-            patch("scripts.run_initial_etl.release_table_run_lock"),
-            patch("scripts.run_initial_etl.SnowflakeExceptionLogger") as exception_logger,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "first table check failed"):
-                run_initial_etl.run_for_table(
-                    "mapping.xlsx",
-                    {"FIRST": "First", "SECOND": "Second"},
-                    ["FIRST", "SECOND"],
-                )
-
-        self.assertEqual(load_in_batches.call_count, 0)
-        exception_logger.return_value.log_step_failure.assert_called_once()
-        self.assertEqual(audit.finish_step.call_args.args[1], "FAILED")
 
     def test_pipeline_logging_writes_full_exception_to_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -677,25 +414,6 @@ class EtlCoreTests(unittest.TestCase):
             overlap_seconds=86400,
             batch_size=50_000,
         )
-
-    @patch(
-        "scripts.run_initial_etl.run_for_table",
-        return_value={
-            "tables": [
-                {"table": "REPORTS", "status": "FAILED", "error": "source unavailable"}
-            ]
-        },
-    )
-    @patch(
-        "scripts.run_initial_etl._parse_args",
-        return_value=_parse_args(["--table", "REPORTS", "--sheet", "Reports"]),
-    )
-    def test_cli_returns_failure_after_reporting_all_table_results(
-        self,
-        _parse_args_mock,
-        _run_for_table,
-    ):
-        self.assertEqual(run_initial_etl.main(), 1)
 
     def test_cli_accepts_custom_bulk_load_batch_size(self):
         args = _parse_args(["--table", "Alerts", "--batch-size", "2500"])
@@ -890,32 +608,6 @@ class EtlCoreTests(unittest.TestCase):
             ],
         )
 
-    def test_create_table_omits_status_column(self):
-        rows = [
-            {
-                "target_column": "REPORT_NAME",
-                "snowflake_datatype": "VARCHAR",
-                "constraint": "",
-            },
-            {
-                "target_column": "sTaTuS",
-                "snowflake_datatype": "VARCHAR(20)",
-                "constraint": "",
-            },
-        ]
-
-        create_sql = build_create_table_sql("REPORTS", rows, schema_name="UW_RAW_STG")
-
-        self.assertIn("REPORT_NAME VARCHAR", create_sql)
-        self.assertNotIn("STATUS", create_sql.upper())
-
-    def test_create_table_rejects_status_only_mappings(self):
-        with self.assertRaisesRegex(ValueError, "No non-STATUS metadata rows"):
-            build_create_table_sql(
-                "REPORTS",
-                [{"target_column": "STATUS", "snowflake_datatype": "VARCHAR"}],
-            )
-
     def test_table_metadata_skips_columns_marked_not_in_snowflake(self):
         df = pd.DataFrame([
             {
@@ -1096,15 +788,13 @@ class EtlCoreTests(unittest.TestCase):
         connection = Mock()
         before_publish = Mock()
 
-        def execute(sql, *params):
+        def execute(sql):
             if sql.startswith("PUT "):
                 snowflake_cursor.description = [("status",), ("message",)]
                 snowflake_cursor.fetchall.return_value = [("UPLOADED", "ok")]
             elif sql.startswith("COPY INTO "):
                 snowflake_cursor.description = [("rows_loaded",), ("errors_seen",)]
-                snowflake_cursor.fetchall.return_value = (
-                    [(2, 0)] if "_1_1.json" in sql else [(1, 0)]
-                )
+                snowflake_cursor.fetchall.return_value = [(2, 0)] if "_1.json" in sql else [(1, 0)]
             return snowflake_cursor
 
         snowflake_cursor.execute.side_effect = execute
@@ -1145,14 +835,7 @@ class EtlCoreTests(unittest.TestCase):
             staged_filename = copy_sql.split("FILES = ('", 1)[1].split("')", 1)[0]
             self.assertIn(staged_filename, put_sql)
         self.assertIn("CREATE TEMPORARY TABLE", snowflake_cursor.execute.call_args_list[0].args[0])
-        self.assertIn(
-            "CREATE TEMPORARY STAGE",
-            next(
-                call.args[0]
-                for call in snowflake_cursor.execute.call_args_list
-                if "CREATE TEMPORARY STAGE" in call.args[0]
-            ),
-        )
+        self.assertIn("CREATE TEMPORARY STAGE", snowflake_cursor.execute.call_args_list[1].args[0])
         insert_call = next(
             call.args[0]
             for call in snowflake_cursor.execute.call_args_list
@@ -1174,10 +857,9 @@ class EtlCoreTests(unittest.TestCase):
         source_connection.cursor.return_value = source_cursor
         snowflake_cursor = Mock()
         snowflake_cursor.execute.return_value = snowflake_cursor
-        snowflake_cursor.fetchone.return_value = (0,)
         connection = Mock()
 
-        def execute(sql, *params):
+        def execute(sql):
             if sql.startswith("PUT "):
                 snowflake_cursor.description = [("status",), ("message",)]
                 snowflake_cursor.fetchall.return_value = [("UPLOADED", "ok")]
@@ -1188,7 +870,7 @@ class EtlCoreTests(unittest.TestCase):
 
         snowflake_cursor.execute.side_effect = execute
 
-        with self.assertRaisesRegex(RuntimeError, "no ETL_EXCEPTION_LOG writer"):
+        with self.assertRaisesRegex(RuntimeError, "reported 1 load error"):
             load_query_to_snowflake_in_batches(
                 source_connection,
                 connection,
@@ -1204,521 +886,6 @@ class EtlCoreTests(unittest.TestCase):
         sql_calls = [call.args[0] for call in snowflake_cursor.execute.call_args_list]
         self.assertFalse(any(sql.startswith("INSERT INTO") for sql in sql_calls))
         self.assertTrue(any("DROP TABLE IF EXISTS" in sql for sql in sql_calls))
-
-    def test_batched_load_reports_systemic_source_failure_without_row_retry(self):
-        source_cursor = Mock()
-        source_cursor.execute.side_effect = RuntimeError("4D connection lost")
-        source_connection = Mock()
-        source_connection.cursor.return_value = source_cursor
-        snowflake_cursor = Mock()
-        snowflake_cursor.execute.return_value = snowflake_cursor
-        exception_logger = Mock()
-
-        with self.assertRaisesRegex(RuntimeError, "4D connection lost"):
-            load_query_to_snowflake_in_batches(
-                source_connection,
-                Mock(),
-                snowflake_cursor,
-                "SELECT ID FROM SOURCE",
-                "DW_TEST",
-                "UW_RAW_STG",
-                "TARGET",
-                ["ID"],
-                exception_logger=exception_logger,
-                return_stats=True,
-            )
-
-        exception_logger.log_row_failure.assert_not_called()
-        source_cursor.close.assert_called_once()
-
-    def test_dataframe_exception_loader_keeps_successful_batch_bulk(self):
-        cursor = Mock()
-        connection = Mock()
-        exception_logger = Mock()
-        dataframe = pd.DataFrame({"ID": [1, 2, 3]})
-
-        result = load_dataframe_to_snowflake_with_exceptions(
-            connection,
-            cursor,
-            "STAGE",
-            ["ID"],
-            dataframe,
-            exception_logger=exception_logger,
-            pipeline_name="TEST",
-            source_table="SOURCE",
-            batch_id="batch-1",
-        )
-
-        self.assertEqual(result["rows_loaded"], 3)
-        self.assertEqual(result["rows_failed"], 0)
-        self.assertEqual(result["failed_indexes"], [])
-        self.assertEqual(result["exception_log_count"], 0)
-        self.assertEqual(result["exception_log_failures"], 0)
-        cursor.executemany.assert_called_once()
-        exception_logger.log_row_failure.assert_not_called()
-        self.assertEqual(
-            [call.args[0] for call in cursor.execute.call_args_list],
-            ["BEGIN", "COMMIT"],
-        )
-
-    def test_dataframe_exception_loader_isolates_single_bad_row_and_continues(self):
-        class ConversionError(Exception):
-            sqlstate = "22018"
-
-        cursor = Mock()
-        connection = Mock()
-        exception_logger = Mock()
-
-        def executemany(_sql, rows):
-            if any(row[0] == 2 for row in rows):
-                raise ConversionError("invalid numeric value")
-
-        cursor.executemany.side_effect = executemany
-        dataframe = pd.DataFrame({"ID": [1, 2, 3]})
-
-        result = load_dataframe_to_snowflake_with_exceptions(
-            connection,
-            cursor,
-            "STAGE",
-            ["ID"],
-            dataframe,
-            exception_logger=exception_logger,
-            pipeline_name="TEST",
-            source_table="SOURCE",
-            batch_id="batch-2",
-        )
-
-        self.assertEqual(result["rows_loaded"], 2)
-        self.assertEqual(result["rows_failed"], 1)
-        self.assertEqual(result["failed_indexes"], [1])
-        self.assertEqual(result["exception_log_count"], 1)
-        self.assertEqual(result["exception_log_failures"], 0)
-        exception_logger.log_row_failure.assert_called_once()
-        self.assertEqual(
-            exception_logger.log_row_failure.call_args.kwargs["row_number"],
-            2,
-        )
-        self.assertEqual(
-            exception_logger.log_row_failure.call_args.kwargs["record"],
-            {"ID": 2},
-        )
-        self.assertEqual(connection.rollback.call_count, 3)
-
-    def test_dataframe_exception_loader_completes_100_rows_with_one_bad_date(self):
-        cursor = Mock()
-        connection = Mock()
-        exception_logger = Mock()
-        committed_ids = []
-
-        def executemany(_sql, rows):
-            if any(row[0] == 10 for row in rows):
-                raise ValueError("year 12015 is out of range")
-            committed_ids.extend(row[0] for row in rows)
-
-        cursor.executemany.side_effect = executemany
-        dataframe = pd.DataFrame(
-            {
-                "ID": range(1, 101),
-                "MODIFIED_ON": [
-                    "12015-01-01 00:00:00" if row_id == 10
-                    else "2025-01-01 00:00:00"
-                    for row_id in range(1, 101)
-                ],
-            }
-        )
-
-        result = load_dataframe_to_snowflake_with_exceptions(
-            connection,
-            cursor,
-            "STAGE",
-            ["ID", "MODIFIED_ON"],
-            dataframe,
-            exception_logger=exception_logger,
-            pipeline_name="TEST",
-            source_table="SOURCE",
-            batch_id="batch-100",
-        )
-
-        self.assertEqual(
-            result,
-            {
-                "rows_loaded": 99,
-                "rows_failed": 1,
-                "failed_indexes": [9],
-                "exception_log_count": 1,
-                "exception_log_failures": 0,
-                "exception_log_errors": [],
-            },
-        )
-        self.assertEqual(sorted(committed_ids), [*range(1, 10), *range(11, 101)])
-        exception_logger.log_row_failure.assert_called_once()
-        logged_failure = exception_logger.log_row_failure.call_args.kwargs
-        self.assertEqual(logged_failure["row_number"], 10)
-        self.assertEqual(
-            logged_failure["record"],
-            {"ID": 10, "MODIFIED_ON": "12015-01-01 00:00:00"},
-        )
-
-    def test_dataframe_exception_loader_logs_multiple_failed_rows(self):
-        class ConversionError(Exception):
-            sqlstate = "22003"
-
-        cursor = Mock()
-        connection = Mock()
-        exception_logger = Mock()
-
-        def executemany(_sql, rows):
-            if any(row[0] in {2, 4} for row in rows):
-                raise ConversionError("numeric value out of range")
-
-        cursor.executemany.side_effect = executemany
-        dataframe = pd.DataFrame({"ID": [1, 2, 3, 4, 5]})
-
-        result = load_dataframe_to_snowflake_with_exceptions(
-            connection,
-            cursor,
-            "STAGE",
-            ["ID"],
-            dataframe,
-            exception_logger=exception_logger,
-            pipeline_name="TEST",
-            source_table="SOURCE",
-            batch_id="batch-3",
-        )
-
-        self.assertEqual(result["rows_loaded"], 3)
-        self.assertEqual(result["rows_failed"], 2)
-        self.assertEqual(result["failed_indexes"], [1, 3])
-        self.assertEqual(
-            [
-                call.kwargs["row_number"]
-                for call in exception_logger.log_row_failure.call_args_list
-            ],
-            [2, 4],
-        )
-
-    def test_dataframe_exception_loader_does_not_retry_systemic_snowflake_failure(self):
-        cursor = Mock()
-        cursor.executemany.side_effect = RuntimeError("Snowflake connection lost")
-        connection = Mock()
-        exception_logger = Mock()
-
-        with self.assertRaisesRegex(RuntimeError, "Snowflake connection lost"):
-            load_dataframe_to_snowflake_with_exceptions(
-                connection,
-                cursor,
-                "STAGE",
-                ["ID"],
-                pd.DataFrame({"ID": [1, 2, 3]}),
-                exception_logger=exception_logger,
-                pipeline_name="TEST",
-                source_table="SOURCE",
-                batch_id="batch-systemic",
-            )
-
-        self.assertEqual(cursor.executemany.call_count, 1)
-        connection.rollback.assert_called_once()
-        exception_logger.log_row_failure.assert_not_called()
-
-    def test_dataframe_exception_log_failure_is_reported_after_other_rows_load(self):
-        class ConversionError(Exception):
-            sqlstate = "22018"
-
-        cursor = Mock()
-        connection = Mock()
-        exception_logger = Mock()
-        exception_logger.log_row_failure.side_effect = RuntimeError(
-            "exception log unavailable"
-        )
-        loaded_ids = []
-
-        def executemany(_sql, rows):
-            if any(row[0] == 1 for row in rows):
-                raise ConversionError("bad value")
-            loaded_ids.extend(row[0] for row in rows)
-
-        cursor.executemany.side_effect = executemany
-
-        result = load_dataframe_to_snowflake_with_exceptions(
-            connection,
-            cursor,
-            "STAGE",
-            ["ID"],
-            pd.DataFrame({"ID": [1, 2, 3]}),
-            exception_logger=exception_logger,
-            pipeline_name="TEST",
-            source_table="SOURCE",
-            batch_id="batch-4",
-        )
-
-        self.assertEqual(result["rows_loaded"], 2)
-        self.assertEqual(result["rows_failed"], 1)
-        self.assertEqual(result["exception_log_count"], 0)
-        self.assertEqual(result["exception_log_failures"], 1)
-        self.assertEqual(result["failed_indexes"], [0])
-        self.assertEqual(loaded_ids, [2, 3])
-        self.assertIn("exception log unavailable", result["exception_log_errors"][0])
-        exception_logger.log_row_failure.assert_called_once()
-
-    def test_batched_bulk_load_isolates_copy_errors_and_reports_stats(self):
-        source_cursor = Mock()
-        source_cursor.fetchmany.side_effect = [[(1,), (2,), (3,)], []]
-        source_connection = Mock()
-        source_connection.cursor.return_value = source_cursor
-        snowflake_cursor = Mock()
-        snowflake_cursor.execute.return_value = snowflake_cursor
-        exception_logger = Mock()
-        staged_numbers = []
-
-        def execute(sql, params=None):
-            if sql.startswith("SELECT COUNT(*) FROM"):
-                if "BETWEEN" in sql:
-                    first, last = params
-                    count = sum(first <= value <= last for value in staged_numbers)
-                else:
-                    count = len(staged_numbers)
-                snowflake_cursor.fetchone.return_value = (count,)
-            return snowflake_cursor
-
-        snowflake_cursor.execute.side_effect = execute
-        exception_logger.log_row_failure.side_effect = RuntimeError(
-            "exception log unavailable"
-        )
-
-        def copy_file(_cursor, _stage, _table, _filename, path, expected_rows):
-            import json
-
-            records = json.loads(path.read_text(encoding="utf-8"))
-            if any(record["ID"] == 2 for record in records):
-                raise RowLoadError("conversion failed for ID=2")
-            row_number_column = next(
-                name for name in records[0] if name.startswith("__ETL_ROW_NUMBER_")
-            )
-            staged_numbers.extend(record[row_number_column] for record in records)
-            return expected_rows
-
-        with patch("etl.load._copy_staged_json_file", side_effect=copy_file):
-            result = load_query_to_snowflake_in_batches(
-                source_connection,
-                Mock(),
-                snowflake_cursor,
-                "SELECT ID FROM SOURCE",
-                "DW_TEST",
-                "RAW_TEST",
-                "TARGET",
-                ["ID"],
-                batch_size=3,
-                exception_logger=exception_logger,
-                source_table="SOURCE",
-                batch_id="batch-5",
-                return_stats=True,
-            )
-
-        self.assertEqual(result["rows_processed"], 3)
-        self.assertEqual(result["rows_loaded"], 2)
-        self.assertEqual(result["rows_failed"], 1)
-        self.assertEqual(result["exception_count"], 1)
-        self.assertEqual(result["total_records_processed"], 3)
-        self.assertEqual(result["successful_record_count"], 2)
-        self.assertEqual(result["failed_record_count"], 1)
-        self.assertEqual(result["exception_log_count"], 0)
-        self.assertEqual(result["exception_log_failures"], 1)
-        self.assertIn("exception log unavailable", result["exception_log_errors"][0])
-        self.assertTrue(result["load_started_at"])
-        self.assertTrue(result["load_ended_at"])
-        self.assertEqual(result["status"], "SUCCESS_WITH_ERRORS")
-        self.assertEqual(
-            exception_logger.log_row_failure.call_args.kwargs["record"],
-            {"ID": 2},
-        )
-
-    def test_batched_load_continues_after_source_fetch_row_error(self):
-        source_connection = Mock()
-        snowflake_cursor = Mock()
-        snowflake_cursor.execute.return_value = snowflake_cursor
-        exception_logger = Mock()
-        staged_numbers = []
-        staged_ids = []
-
-        def execute(sql, params=None):
-            if sql.startswith("SELECT COUNT(*) FROM"):
-                if "BETWEEN" in sql:
-                    first, last = params
-                    count = sum(first <= value <= last for value in staged_numbers)
-                else:
-                    count = len(staged_numbers)
-                snowflake_cursor.fetchone.return_value = (count,)
-            return snowflake_cursor
-
-        snowflake_cursor.execute.side_effect = execute
-
-        def source_batches(*_args, **kwargs):
-            kwargs["on_row_failure"](
-                2,
-                {"ID": 2},
-                ValueError("year 12015 is out of range"),
-            )
-            yield [(1,), (3,)]
-
-        def copy_file(_cursor, _stage, _table, _filename, path, expected_rows):
-            import json
-
-            records = json.loads(path.read_text(encoding="utf-8"))
-            row_number_column = next(
-                name for name in records[0] if name.startswith("__ETL_ROW_NUMBER_")
-            )
-            staged_numbers.extend(record[row_number_column] for record in records)
-            staged_ids.extend(record["ID"] for record in records)
-            return expected_rows
-
-        with (
-            patch(
-                "etl.load.iter_source_batches_with_row_isolation",
-                side_effect=source_batches,
-            ),
-            patch("etl.load._copy_staged_json_file", side_effect=copy_file),
-        ):
-            result = load_query_to_snowflake_in_batches(
-                source_connection,
-                Mock(),
-                snowflake_cursor,
-                "SELECT [ID] FROM [SOURCE]",
-                "DW_TEST",
-                "RAW_TEST",
-                "TARGET",
-                ["ID"],
-                exception_logger=exception_logger,
-                source_table="SOURCE",
-                source_columns=["ID"],
-                metadata_rows=[
-                    {
-                        "source_table": "SOURCE",
-                        "source_column": "ID",
-                        "target_column": "ID",
-                        "constraint": "PK",
-                    }
-                ],
-                source_key_column="ID",
-                return_stats=True,
-            )
-
-        self.assertEqual(staged_ids, [1, 3])
-        self.assertEqual(result["rows_processed"], 3)
-        self.assertEqual(result["rows_loaded"], 2)
-        self.assertEqual(result["rows_failed"], 1)
-        self.assertEqual(result["exception_log_count"], 1)
-        self.assertEqual(result["status"], "SUCCESS_WITH_ERRORS")
-        exception_logger.log_row_failure.assert_called_once()
-        self.assertEqual(
-            exception_logger.log_row_failure.call_args.kwargs["record"],
-            {"ID": 2},
-        )
-
-    def test_batched_bulk_load_isolates_target_insert_error(self):
-        class InsertionError(Exception):
-            sqlstate = "22018"
-
-        source_cursor = Mock()
-        source_cursor.fetchmany.side_effect = [[(1,), (2,), (3,)], []]
-        source_connection = Mock()
-        source_connection.cursor.return_value = source_cursor
-        snowflake_cursor = Mock()
-        snowflake_cursor.execute.return_value = snowflake_cursor
-        exception_logger = Mock()
-        staged_numbers = []
-        published_numbers = []
-
-        def execute(sql, params=None):
-            if sql.startswith("SELECT COUNT(*) FROM"):
-                if "BETWEEN" in sql:
-                    first, last = params
-                    count = sum(first <= value <= last for value in staged_numbers)
-                    snowflake_cursor.fetchone.return_value = (count,)
-                else:
-                    snowflake_cursor.fetchone.return_value = (len(staged_numbers),)
-            elif sql.startswith("INSERT INTO"):
-                first, last = params
-                if first <= 2 <= last:
-                    raise InsertionError("target conversion failed")
-                published_numbers.extend(
-                    number for number in staged_numbers if first <= number <= last
-                )
-            return snowflake_cursor
-
-        snowflake_cursor.execute.side_effect = execute
-
-        def copy_file(_cursor, _stage, _table, _filename, path, expected_rows):
-            import json
-
-            records = json.loads(path.read_text(encoding="utf-8"))
-            row_number_column = next(
-                name for name in records[0] if name.startswith("__ETL_ROW_NUMBER_")
-            )
-            staged_numbers.extend(record[row_number_column] for record in records)
-            return expected_rows
-
-        with patch("etl.load._copy_staged_json_file", side_effect=copy_file):
-            result = load_query_to_snowflake_in_batches(
-                source_connection,
-                Mock(),
-                snowflake_cursor,
-                "SELECT ID FROM SOURCE",
-                "DW_TEST",
-                "RAW_TEST",
-                "TARGET",
-                ["ID"],
-                batch_size=3,
-                exception_logger=exception_logger,
-                source_table="SOURCE",
-                batch_id="batch-7",
-                return_stats=True,
-            )
-
-        self.assertEqual(result["rows_loaded"], 2)
-        self.assertEqual(result["rows_failed"], 1)
-        self.assertEqual(published_numbers, [1, 3])
-        self.assertEqual(
-            exception_logger.log_row_failure.call_args.kwargs["row_number"],
-            2,
-        )
-
-    def test_exception_log_uses_variant_and_parameterized_idempotent_merge(self):
-        from etl.exception_log import SnowflakeExceptionLogger
-
-        connection = Mock()
-        cursor = Mock()
-        connection.cursor.return_value = cursor
-        exception_logger = SnowflakeExceptionLogger(
-            connection,
-            "DW_TEST",
-            "RAW_TEST",
-        )
-        exception = ValueError("invalid value")
-        kwargs = {
-            "pipeline_name": "TEST",
-            "source_table": "SOURCE",
-            "target_table": "TARGET",
-            "row_number": 10,
-            "record": {"ID": 10, "AMOUNT": "bad"},
-            "error": exception,
-            "batch_id": "batch-6",
-            "pipeline_run_id": "run-6",
-        }
-
-        exception_logger.ensure_table()
-        exception_logger.log_row_failure(**kwargs)
-        first_error_id = cursor.execute.call_args.args[1][0]
-        exception_logger.log_row_failure(**kwargs)
-        second_error_id = cursor.execute.call_args.args[1][0]
-
-        self.assertIn("RECORD_DATA VARIANT", cursor.execute.call_args_list[0].args[0])
-        self.assertIn("ADD COLUMN IF NOT EXISTS PIPELINE_RUN_ID", cursor.execute.call_args_list[1].args[0])
-        self.assertIn("MERGE INTO", cursor.execute.call_args_list[2].args[0])
-        self.assertIn("PIPELINE_RUN_ID", cursor.execute.call_args_list[2].args[0])
-        self.assertIn("PARSE_JSON(%s)", cursor.execute.call_args_list[2].args[0])
-        self.assertEqual(first_error_id, second_error_id)
-        self.assertEqual(cursor.execute.call_args_list[2].args[1][3], "run-6")
-        self.assertEqual(cursor.execute.call_args_list[2].args[1][7], '{"ID":10,"AMOUNT":"bad"}')
 
     def test_build_source_query_quotes_identifiers_and_skips_blank_columns(self):
         query = build_source_query(

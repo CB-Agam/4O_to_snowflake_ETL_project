@@ -23,7 +23,6 @@ class SnowflakeAuditLogger:
         self.connection = connection
         self.run_id = str(uuid4())
         self._step_number = 0
-        self.last_failed_step: str | None = None
         qualified_table = ".".join(
             (
                 _quote_snowflake_identifier(database),
@@ -138,7 +137,6 @@ class SnowflakeAuditLogger:
         action: Callable[[], _T],
         table_name: str | None = None,
     ) -> _T:
-        self.last_failed_step = None
         step_number = self.record(step, "RUNNING", table_name, f"{step} started")
         try:
             result = action()
@@ -153,7 +151,6 @@ class SnowflakeAuditLogger:
                 logger.exception("Could not store interrupted step %s in Snowflake audit table", step)
             raise
         except Exception as step_error:
-            self.last_failed_step = step
             error_message = traceback.format_exc()
             try:
                 self.finish_step(
