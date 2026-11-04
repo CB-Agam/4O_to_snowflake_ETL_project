@@ -121,7 +121,9 @@ For a target such as `CLAIMS`:
 3. The source table is extracted in full. The loader checks mapped columns and,
    when using timestamp/key mode, verifies the source metadata and that the
    declared key is non-null and unique in the extracted dataset.
-4. The extracted rows are loaded into a unique staging table. The mapped data
+4. The extracted rows are loaded into a unique staging table. Row-level
+   conversion or insertion errors are isolated by splitting only the failing
+   batch; rejected records are stored in `ETL_EXCEPTION_LOG`. The mapped data
    and state snapshot are validated before the current table is changed.
 5. A DML transaction replaces current data and persists the source-row state,
    watermark, and successful batch status together.
@@ -180,7 +182,10 @@ database and schema:
   hashes, and modification timestamps used to compare future runs.
 - `ETL_INCREMENTAL_BATCH_LOG`: one batch record with status, source scan and
   extraction counts, changes, inserts, updates, deletions, history row count,
-  watermark boundaries, duration, and error details.
+  failed-row and exception counts, watermark boundaries, duration, and error
+  details.
+- `ETL_EXCEPTION_LOG`: rejected source records as `VARIANT`, with error details,
+  source/target identifiers, row number, timestamp, batch ID, and retry status.
 
 The current full-load and incremental modes both acquire the shared per-table
 lock before target-table preparation and hold it through extraction and load.
@@ -188,8 +193,11 @@ The full-load mode creates only the lock/state table; the source-row snapshot
 and batch log are created by incremental mode.
 
 The existing `ETL_PIPELINE_LOG` continues to record the runner's step-level
-audit lifecycle. Batch states use `RUNNING`, `SUCCESS`, `FAILED`, or
-`INTERRUPTED`; `CHANGE_STATUS` distinguishes `CHANGED` from `NO_CHANGE`.
+audit lifecycle. Batch states use `RUNNING`, `SUCCESS`, `SUCCESS_WITH_ERRORS`,
+`FAILED`, or `INTERRUPTED`; `CHANGE_STATUS` distinguishes `CHANGED` from
+`NO_CHANGE`. Failed rows retain or omit their source-state entries so the next
+incremental run can rediscover them. Failure to write `ETL_EXCEPTION_LOG` fails
+the load explicitly.
 Passwords and connection tokens are not written to these records.
 
 The loader creates the history and helper objects, and the unique staging
@@ -258,8 +266,11 @@ resolved rather than proceeding without a unique lock.
    batch and history contains the previous current rows.
 6. Test a deletion only in the development source and verify the logged delete
    count. Do not infer that the current table contains a deleted-row tombstone.
-7. Inject or simulate a staging, history-insert, and current-replacement failure
-   in unit tests. Confirm rollback, unchanged state/watermark, and safe retry.
+7. Inject or simulate a row conversion error during staging and verify that
+   valid rows continue, the rejected row is recorded once in
+   `ETL_EXCEPTION_LOG`, and its source state remains eligible for retry.
+8. Inject or simulate a history-insert and current-replacement failure in unit
+   tests. Confirm rollback, unchanged state/watermark, and safe retry.
 
 Unit tests use mocked 4D and Snowflake connections and do not modify real
 Snowflake or 4D data. No live integration test was run because the 4D ODBC

@@ -72,6 +72,39 @@ def _timestamp_metadata_cursor():
 
 
 class IncrementalStrategyTests(unittest.TestCase):
+    def test_failed_timestamp_row_keeps_previous_state_for_next_run(self):
+        old_modified = datetime(2024, 1, 1)
+        old_created = datetime(2023, 1, 1)
+        old_state = {
+            "2": ("old-hash", old_modified, old_created),
+        }
+        new_state = [
+            ("CLAIMS", "1", "hash-1", datetime(2024, 1, 2), old_created),
+            ("CLAIMS", "2", "new-hash", datetime(2024, 1, 3), old_created),
+        ]
+        failed_rows = pd.DataFrame(
+            {"CLAIM_ID": [2], "MODIFIED_ON": [datetime(2024, 1, 3)]}
+        )
+
+        pending = incremental._keep_failed_rows_pending(
+            new_state,
+            old_state,
+            failed_rows,
+            "CLAIMS",
+            {
+                "strategy": "KEY_TIMESTAMP",
+                "key_target_column": "CLAIM_ID",
+            },
+        )
+
+        self.assertEqual(
+            pending,
+            [
+                ("CLAIMS", "1", "hash-1", datetime(2024, 1, 2), old_created),
+                ("CLAIMS", "2", "old-hash", old_modified, old_created),
+            ],
+        )
+
     def test_day_zero_row_state_contains_complete_initial_dataset(self):
         rows = _claim_mapping()
         data = pd.DataFrame(
@@ -674,6 +707,72 @@ class IncrementalTransactionTests(unittest.TestCase):
         self.assertIn("CREATE TEMPORARY TABLE", "\n".join(sql_calls))
         self.assertFalse(
             any("ADD COLUMN IF NOT EXISTS" in sql for sql in sql_calls)
+        )
+
+    def test_initial_incremental_load_records_and_keeps_failed_row_pending(self):
+        import contextlib
+
+        cursor = Mock()
+        cursor.execute.return_value = cursor
+        cursor.fetchone.return_value = (0,)
+        connection = Mock()
+        initial = pd.DataFrame(
+            {
+                "CLAIM_ID": [1, 2],
+                "MODIFIED_ON": [
+                    datetime(2025, 1, 1),
+                    datetime(2025, 1, 2),
+                ],
+                "AMOUNT": [10, 20],
+            }
+        )
+        exception_logger = Mock()
+        with contextlib.ExitStack() as stack:
+            self._patch_initial_dependencies(stack)
+            stack.enter_context(patch("etl.incremental.pd.read_sql", return_value=initial))
+            stage_load = stack.enter_context(
+                patch.object(
+                    incremental,
+                    "load_dataframe_to_snowflake_with_exceptions",
+                    return_value={
+                        "rows_loaded": 1,
+                        "rows_failed": 1,
+                        "failed_indexes": [1],
+                    },
+                )
+            )
+            replace_state = stack.enter_context(
+                patch.object(incremental, "_replace_row_state")
+            )
+            finish = stack.enter_context(patch.object(incremental, "_finish_batch"))
+
+            result = incremental.incremental_load_table(
+                Mock(),
+                connection,
+                cursor,
+                "DW_TEST",
+                "RAW_TEST",
+                "CLAIMS",
+                _claim_mapping(),
+                "run-with-row-error",
+                exception_logger=exception_logger,
+            )
+
+        self.assertEqual(result["status"], "SUCCESS_WITH_ERRORS")
+        self.assertEqual(result["rows_processed"], 2)
+        self.assertEqual(result["rows_loaded"], 1)
+        self.assertEqual(result["rows_failed"], 1)
+        self.assertEqual(result["exception_count"], 1)
+        self.assertEqual(finish.call_args.args[3], "SUCCESS_WITH_ERRORS")
+        self.assertEqual(finish.call_args.args[4]["failed"], 1)
+        self.assertEqual(finish.call_args.args[4]["exception_count"], 1)
+        self.assertEqual(
+            [row[1] for row in replace_state.call_args.args[3]],
+            ["1"],
+        )
+        self.assertEqual(
+            stage_load.call_args.kwargs["target_table_name"],
+            "CLAIMS",
         )
 
     def test_no_change_batch_keeps_current_history_and_watermark_unchanged(self):

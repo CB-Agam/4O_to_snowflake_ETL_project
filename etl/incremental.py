@@ -7,14 +7,19 @@ import math
 import re
 import time
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Sequence
 from uuid import uuid4
 
 import pandas as pd
 
-from etl.load import build_source_query, load_dataframe_to_snowflake
+from etl.exception_log import SnowflakeExceptionLogger
+from etl.load import (
+    build_source_query,
+    load_dataframe_to_snowflake,
+    load_dataframe_to_snowflake_with_exceptions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -760,6 +765,8 @@ def _ensure_helper_tables(cursor, database: str, schema: str) -> dict[str, str]:
             UPDATED_ROW_COUNT NUMBER(38, 0),
             DELETED_ROW_COUNT NUMBER(38, 0),
             HISTORY_ROW_COUNT NUMBER(38, 0),
+            FAILED_ROW_COUNT NUMBER(38, 0),
+            EXCEPTION_LOG_COUNT NUMBER(38, 0),
             CHANGE_STATUS VARCHAR(20),
             OLD_WATERMARK TIMESTAMP_NTZ,
             NEW_WATERMARK TIMESTAMP_NTZ,
@@ -772,6 +779,12 @@ def _ensure_helper_tables(cursor, database: str, schema: str) -> dict[str, str]:
     )
     cursor.execute(
         f"ALTER TABLE {batch_log} ADD COLUMN IF NOT EXISTS CHANGE_STATUS VARCHAR(20)"
+    )
+    cursor.execute(
+        f"ALTER TABLE {batch_log} ADD COLUMN IF NOT EXISTS FAILED_ROW_COUNT NUMBER(38, 0)"
+    )
+    cursor.execute(
+        f"ALTER TABLE {batch_log} ADD COLUMN IF NOT EXISTS EXCEPTION_LOG_COUNT NUMBER(38, 0)"
     )
     return {"state": state, "row_state": row_state, "batch_log": batch_log}
 
@@ -963,6 +976,8 @@ def _finish_batch(
             UPDATED_ROW_COUNT = %s,
             DELETED_ROW_COUNT = %s,
             HISTORY_ROW_COUNT = %s,
+            FAILED_ROW_COUNT = %s,
+            EXCEPTION_LOG_COUNT = %s,
             CHANGE_STATUS = %s,
             NEW_WATERMARK = %s,
             END_TIME = CURRENT_TIMESTAMP(),
@@ -979,6 +994,8 @@ def _finish_batch(
             counts.get("updated"),
             counts.get("deleted"),
             counts.get("history"),
+            counts.get("failed"),
+            counts.get("exception_count"),
             change_status,
             new_watermark,
             duration_seconds,
@@ -1029,6 +1046,53 @@ def _ensure_history_table(cursor, current_table: str, history_table: str) -> Non
     )
 
 
+def _keep_failed_rows_pending(
+    new_state: Sequence[tuple[str, str, str | None, datetime | None, datetime | None]],
+    old_state: dict[str, tuple[str | None, datetime | None] | tuple[str | None, datetime | None, datetime | None]],
+    failed_rows: pd.DataFrame,
+    table_name: str,
+    strategy: dict[str, Any],
+) -> list[tuple[str, str, str | None, datetime | None, datetime | None]]:
+    if failed_rows.empty:
+        return list(new_state)
+
+    failed_keys: set[str] = set()
+    failed_hashes: set[str] = set()
+    if strategy["strategy"] == "KEY_TIMESTAMP":
+        key_column = strategy["key_target_column"]
+        failed_keys = {
+            _source_key(value) for value in failed_rows[key_column].tolist()
+        }
+    elif strategy["strategy"] == "KEY_HASH":
+        key_columns = strategy["key_target_columns"]
+        failed_keys = {
+            _natural_key_hash(tuple(values[column] for column in key_columns))
+            for values in failed_rows.to_dict(orient="records")
+        }
+    else:
+        failed_hashes = {
+            _row_hash(record)
+            for record in failed_rows.itertuples(index=False, name=None)
+        }
+
+    pending_state = []
+    for row in new_state:
+        state_key = row[1]
+        if strategy["strategy"] == "ROW_HASH" and row[2] in failed_hashes:
+            continue
+        if strategy["strategy"] != "ROW_HASH" and state_key in failed_keys:
+            previous = old_state.get(state_key)
+            if previous is None:
+                continue
+            row_hash, modified_at, created_at = _saved_timestamps(previous)
+            pending_state.append(
+                (table_name, state_key, row_hash, modified_at, created_at)
+            )
+            continue
+        pending_state.append(row)
+    return pending_state
+
+
 def incremental_load_table(
     fourd_connection,
     snowflake_connection,
@@ -1040,6 +1104,8 @@ def incremental_load_table(
     run_id: str,
     overlap_seconds: int = 86400,
     table_lock: dict[str, str] | None = None,
+    exception_logger: SnowflakeExceptionLogger | None = None,
+    pipeline_name: str = "4D_TO_SNOWFLAKE_ETL",
 ) -> dict[str, Any]:
     if overlap_seconds < 0:
         raise ValueError("Incremental overlap seconds cannot be negative")
@@ -1051,6 +1117,7 @@ def incremental_load_table(
     batch_id = str(uuid4())
     lock_owner = table_lock["owner"] if table_lock else batch_id
     started = time.monotonic()
+    load_started_at = datetime.now(timezone.utc)
     locked = False
     batch_started = False
     operation_error: BaseException | None = None
@@ -1062,6 +1129,8 @@ def incremental_load_table(
         "updated": None,
         "deleted": 0,
         "history": 0,
+        "failed": 0,
+        "exception_count": 0,
     }
     old_watermark: datetime | None = None
     paths: dict[str, str] = {}
@@ -1259,6 +1328,16 @@ def incremental_load_table(
                 "strategy": strategy["strategy"],
                 "status": "NO_CHANGE",
                 "rows_loaded": 0,
+                "rows_processed": 0,
+                "rows_failed": 0,
+                "exception_count": 0,
+                "total_records_processed": 0,
+                "successful_record_count": 0,
+                "failed_record_count": 0,
+                "exception_log_count": 0,
+                "load_started_at": load_started_at.isoformat(),
+                "load_ended_at": datetime.now(timezone.utc).isoformat(),
+                "overall_status": "NO_CHANGE",
                 **counts,
                 "watermark": old_watermark,
             }
@@ -1266,13 +1345,48 @@ def incremental_load_table(
         snowflake_cursor.execute(
             f"CREATE TEMPORARY TABLE {stage_table} LIKE {current_table}"
         )
-        load_dataframe_to_snowflake(
-            snowflake_cursor,
-            f"ETL_STAGE_{batch_id.replace('-', '')[:24].upper()}",
-            stage_target_columns,
-            changed_df,
-            schema_name=f"{_quote_identifier(database)}.{_quote_identifier(schema)}",
-        )
+        if exception_logger is None:
+            load_dataframe_to_snowflake(
+                snowflake_cursor,
+                f"ETL_STAGE_{batch_id.replace('-', '')[:24].upper()}",
+                stage_target_columns,
+                changed_df,
+                schema_name=f"{_quote_identifier(database)}.{_quote_identifier(schema)}",
+            )
+        else:
+            source_table = next(
+                row["source_table"].strip()
+                for row in metadata_rows
+                if row.get("source_table", "").strip()
+                and row.get("source_column", "").strip()
+                and row.get("target_column", "").strip()
+            )
+            stage_load = load_dataframe_to_snowflake_with_exceptions(
+                snowflake_connection,
+                snowflake_cursor,
+                f"ETL_STAGE_{batch_id.replace('-', '')[:24].upper()}",
+                stage_target_columns,
+                changed_df,
+                exception_logger=exception_logger,
+                pipeline_name=pipeline_name,
+                source_table=source_table,
+                batch_id=batch_id,
+                schema_name=f"{_quote_identifier(database)}.{_quote_identifier(schema)}",
+                target_table_name=table_name,
+            )
+            counts["failed"] = stage_load["rows_failed"]
+            counts["exception_count"] = stage_load["rows_failed"]
+            if stage_load["failed_indexes"]:
+                failed_frame = changed_df.iloc[
+                    stage_load["failed_indexes"]
+                ].reset_index(drop=True)
+                new_state = _keep_failed_rows_pending(
+                    new_state,
+                    old_state,
+                    failed_frame,
+                    table_name,
+                    strategy,
+                )
         _renew_lock(
             snowflake_cursor,
             snowflake_connection,
@@ -1320,7 +1434,7 @@ def incremental_load_table(
             snowflake_cursor,
             paths["batch_log"],
             batch_id,
-            "SUCCESS",
+            "SUCCESS_WITH_ERRORS" if counts["failed"] else "SUCCESS",
             counts,
             new_watermark,
             time.monotonic() - started,
@@ -1345,10 +1459,20 @@ def incremental_load_table(
             "table": table_name,
             "batch_id": batch_id,
             "strategy": strategy["strategy"],
-            "status": "SUCCESS",
-            "rows_loaded": counts["changed"],
+            "status": "SUCCESS_WITH_ERRORS" if counts["failed"] else "SUCCESS",
+            "rows_loaded": counts["changed"] - counts["failed"],
+            "rows_processed": counts["changed"],
+            "rows_failed": counts["failed"],
+            "exception_count": counts["exception_count"],
+            "total_records_processed": counts["changed"],
+            "successful_record_count": counts["changed"] - counts["failed"],
+            "failed_record_count": counts["failed"],
+            "exception_log_count": counts["exception_count"],
+            "load_started_at": load_started_at.isoformat(),
+            "load_ended_at": datetime.now(timezone.utc).isoformat(),
             "watermark": new_watermark,
             **counts,
+            "overall_status": "SUCCESS_WITH_ERRORS" if counts["failed"] else "SUCCESS",
         }
     except BaseException as exc:
         operation_error = exc

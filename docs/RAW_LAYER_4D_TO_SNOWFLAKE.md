@@ -178,20 +178,19 @@ target is missing, `build_create_table_sql()` in `etl/ddl.py` builds and runs
 declared primary-key constraint when the mapping contains one, and managed
 `CREATED_TIMESTAMP` and `UPDATED_TIMESTAMP` columns when mapped.
 
-For an existing target, the current code drops a `STATUS` column if present,
-widens mapped CLOB columns where the mapping requests it, and fills NULLs in
-managed ETL timestamp columns. These operations require appropriate Snowflake
+For an existing target, the runner drops a `STATUS` column if present, widens
+mapped CLOB columns where the mapping requests it, and fills NULLs in managed
+ETL timestamp columns. The DDL operations require appropriate Snowflake
 privileges. Dropping `STATUS` removes that column and its existing values.
 
 **Output and next step:** The target schema is prepared before extraction and
 loading.
 
-**Failure handling and logging:** DDL or preparation errors fail the wrapped
-audit step and stop the run. These operations are represented by
-`CHECK_TARGET_TABLE`, `CREATE_TARGET_TABLE`, `DROP_STATUS_COLUMN`,
-`WIDEN_CLOB_COLUMN`, and `ENFORCE_TIMESTAMP_COLUMN` events as applicable.
-Snowflake DDL is not part of the incremental loader's transactional DML
-replacement.
+**Failure handling and logging:** DDL or preparation errors stop the run.
+Table checks, creation, CLOB widening, and timestamp enforcement are represented
+by their respective audit events. The `STATUS` cleanup is deliberately not
+written as a separate audit event. Snowflake DDL is not part of the incremental
+loader's transactional DML replacement.
 
 ### 8. Extract mapped rows from 4D
 
@@ -232,9 +231,22 @@ existing target. Re-running it inserts the source rows again. It is therefore
 not an idempotent replacement process.
 
 **Failure handling and logging:** Extraction or staging errors are recorded
-as a failed `BATCHED_BULK_LOAD` step. Until every chunk is staged and verified,
-the target is unchanged. If the final insert fails, its DML transaction is
-rolled back; the error is raised and the temporary stage is cleaned up.
+as a failed `BATCHED_BULK_LOAD` step. When a batch reports a data/conversion
+error, the loader splits only that batch and retries its halves until individual
+rejected rows are isolated. Accepted rows are published in transactions and
+rejected rows are written to `ETL_EXCEPTION_LOG`; later batches and mapped
+tables continue. A failure writing the exception log is raised and is not
+silently ignored. Infrastructure, schema, and other non-row errors still fail
+the load. Final table and pipeline status is `SUCCESS_WITH_ERRORS` when any
+rows were rejected; the summary includes processed, loaded, and failed counts.
+
+`ETL_EXCEPTION_LOG` is created in the configured Snowflake database and schema.
+It stores a deterministic error ID, pipeline/source/target names, source row
+number, failed record as `VARIANT`, full Python exception traceback, error type,
+timestamp, batch ID, and `RETRY_STATUS = 'PENDING'`. Reprocessing the same
+source row with the same data and error merges against the existing error ID
+instead of adding another entry. The Snowflake role needs permission to create
+and write to this table.
 
 ### 10. Load changed batches in opt-in incremental mode
 
@@ -257,7 +269,11 @@ from workbook metadata:
   distinguish a source update from a delete plus insert without a unique key.
 
 Changed rows are loaded to a temporary staging table and validated before the
-transactional DML starts. On a changed non-initial batch, the previous current
+transactional DML starts. Data/conversion errors in stage insertion are isolated
+by splitting only the failing batch; rejected rows are written to
+`ETL_EXCEPTION_LOG`, while valid rows continue. Failed keyed rows retain their
+previous row-state value (or remain uninitialized) so a later incremental run
+can rediscover them. On a changed non-initial batch, the previous current
 table contents are appended to `_H`; current rows are deleted and replaced
 with the staged changed rows. Source-row state, watermark, and successful
 batch status are updated as part of the same DML transaction. Initial load
@@ -269,7 +285,9 @@ then releases the table lock and closes connections.
 
 **Failure handling and logging:** `INCREMENTAL_LOAD` is recorded in
 `ETL_PIPELINE_LOG`; batch counts, watermarks, duration, and failure details are
-written to `ETL_INCREMENTAL_BATCH_LOG`. A DML failure triggers rollback,
+written to `ETL_INCREMENTAL_BATCH_LOG`, including failed-row and exception
+counts. A batch with isolated row failures is marked `SUCCESS_WITH_ERRORS`
+and the overall pipeline uses the same status. A DML failure triggers rollback,
 attempts to record a failed batch without advancing the watermark, and
 re-raises the error. Staging and helper-object DDL is created outside the
 critical transaction because Snowflake DDL has different transaction behavior

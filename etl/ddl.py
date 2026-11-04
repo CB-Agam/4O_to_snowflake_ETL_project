@@ -32,9 +32,17 @@ def build_create_table_sql(table_name: str, rows: List[Dict[str, str]], schema_n
 
     table_name = str(table_name).strip()
     column_definitions: List[str] = []
-    pk_columns = [row["target_column"] for row in rows if is_primary_key(row.get("constraint"))]
+    target_rows = [
+        row
+        for row in rows
+        if row.get("target_column")
+        and row["target_column"].strip().casefold() != "status"
+    ]
+    if not target_rows:
+        raise ValueError(f"No non-STATUS metadata rows provided for table: {table_name}")
+    pk_columns = [row["target_column"] for row in target_rows if is_primary_key(row.get("constraint"))]
 
-    for row in rows:
+    for row in target_rows:
         column_name = row.get("target_column")
         if not column_name:
             continue

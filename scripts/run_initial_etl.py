@@ -19,6 +19,7 @@ from config.logging_config import configure_logging
 from connections.fourd_connection import connect_to_4d
 from connections.snowflake_connection import connect_to_snowflake
 from etl.audit import SnowflakeAuditLogger
+from etl.exception_log import SnowflakeExceptionLogger
 from etl.ddl import (
     build_create_table_sql,
     build_drop_status_column_sql,
@@ -140,6 +141,16 @@ def run_for_table(
 
         snowflake_cursor = audit.run_step("OPEN_SNOWFLAKE_CURSOR", snowflake_conn.cursor)
         try:
+            exception_logger = SnowflakeExceptionLogger(
+                snowflake_conn,
+                settings.snowflake_database,
+                settings.snowflake_schema,
+            )
+            audit.run_step(
+                "ENSURE_EXCEPTION_LOG_TABLE",
+                exception_logger.ensure_table,
+                audit_table_name,
+            )
             fourd_conn = audit.run_step("CONNECT_4D", connect_to_4d)
             try:
                 summary = []
@@ -187,15 +198,11 @@ def run_for_table(
                                 table_name,
                                 "Target table already exists",
                             )
-                            audit.run_step(
-                                "DROP_STATUS_COLUMN",
-                                lambda: snowflake_cursor.execute(
-                                    build_drop_status_column_sql(
-                                        table_name,
-                                        schema_name=settings.snowflake_schema,
-                                    )
-                                ),
-                                table_name,
+                            snowflake_cursor.execute(
+                                build_drop_status_column_sql(
+                                    table_name,
+                                    schema_name=settings.snowflake_schema,
+                                )
                             )
                             for statement in build_widen_clob_columns_sql(
                                 table_name,
@@ -244,6 +251,7 @@ def run_for_table(
                                     audit.run_id,
                                     overlap_seconds=overlap_seconds,
                                     table_lock=table_lock,
+                                    exception_logger=exception_logger,
                                 ),
                                 table_name,
                             )
@@ -271,7 +279,7 @@ def run_for_table(
                                 table_name,
                             )
 
-                        inserted = audit.run_step(
+                        load_result = audit.run_step(
                             "BATCHED_BULK_LOAD",
                             lambda: load_query_to_snowflake_in_batches(
                                 fourd_conn,
@@ -284,15 +292,27 @@ def run_for_table(
                                 target_columns,
                                 batch_size=batch_size,
                                 before_publish=renew_lock_before_publish,
+                                exception_logger=exception_logger,
+                                source_table=source_table,
+                                pipeline_name="4D_TO_SNOWFLAKE_ETL",
+                                return_stats=True,
                             ),
                             table_name,
                         )
+                        if not isinstance(load_result, dict):
+                            load_result = {
+                                "rows_loaded": int(load_result),
+                                "rows_processed": int(load_result),
+                                "rows_failed": 0,
+                                "exception_count": 0,
+                                "status": "SUCCESS",
+                            }
                         summary.append({
                             "table": table_name,
                             "source_table": source_table,
                             "source_columns": source_columns,
                             "target_columns": target_columns,
-                            "rows_loaded": inserted,
+                            **load_result,
                         })
                     finally:
                         audit.run_step(
@@ -313,17 +333,28 @@ def run_for_table(
                 snowflake_cursor.close,
                 audit_table_name,
             )
+        final_status = (
+            "SUCCESS_WITH_ERRORS"
+            if any(item.get("status") == "SUCCESS_WITH_ERRORS" for item in summary)
+            else "SUCCESS"
+        )
+
+        def table_result_message(item: dict) -> str:
+            if item.get("status") == "NO_CHANGE":
+                return f"No changes for {item['table']}"
+            if item.get("status") == "SUCCESS_WITH_ERRORS":
+                return (
+                    f"Loaded {item['rows_loaded']} of "
+                    f"{item.get('rows_processed', item['rows_loaded'])} rows into "
+                    f"{item['table']} with {item.get('rows_failed', 0)} row error(s); "
+                    f"{item.get('exception_count', 0)} exception(s) logged"
+                )
+            return f"Loaded {item['rows_loaded']} rows into {item['table']}"
+
         audit.finish_step(
             pipeline_step_number,
-            "SUCCESS",
-            "; ".join(
-                (
-                    f"No changes for {item['table']}"
-                    if item.get("status") == "NO_CHANGE"
-                    else f"Loaded {item['rows_loaded']} rows into {item['table']}"
-                )
-                for item in summary
-            ),
+            final_status,
+            "; ".join(table_result_message(item) for item in summary),
         )
         return {"tables": summary}
     except KeyboardInterrupt:
@@ -474,6 +505,13 @@ def main() -> int:
         for item in result["tables"]:
             if item.get("status") == "NO_CHANGE":
                 message = f"No changes detected for {item['table']}"
+            elif item.get("status") == "SUCCESS_WITH_ERRORS":
+                message = (
+                    f"Loaded {item['rows_loaded']} of {item['rows_processed']} rows into "
+                    f"{item['table']} from {item['source_table']}; "
+                    f"{item['rows_failed']} row error(s), "
+                    f"{item['exception_count']} exception(s) logged"
+                )
             else:
                 message = (
                     f"Loaded {item['rows_loaded']} changed rows into {item['table']} "
@@ -482,7 +520,13 @@ def main() -> int:
             logger.info(message)
             print(message)
 
-        logger.info("ETL run completed successfully")
+        if any(
+            item.get("status") == "SUCCESS_WITH_ERRORS"
+            for item in result["tables"]
+        ):
+            logger.warning("ETL run completed with row-level errors")
+        else:
+            logger.info("ETL run completed successfully")
         return 0
     except Exception:
         logger.exception("ETL pipeline failed")
