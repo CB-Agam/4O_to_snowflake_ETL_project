@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import json
 import tempfile
+import shutil
+import time
 from collections.abc import Callable
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -18,6 +20,10 @@ from etl.quarantine import record_quarantine
 logger = logging.getLogger(__name__)
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
 _CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
+
+
+class StageUploadError(RuntimeError):
+    """Local file could not be uploaded; do not treat this as source-row data."""
 
 
 def _json_value(value: Any) -> Any:
@@ -42,9 +48,29 @@ def _copy_staged_json_file(
     expected_rows: int,
 ) -> int:
     file_uri = file_path.resolve().as_uri().replace("'", "''")
-    snowflake_cursor.execute(
-        f"PUT '{file_uri}' @{stage} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
-    )
+    if not file_path.is_file():
+        raise StageUploadError(f"Staged local file does not exist: {file_path}")
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            if not file_path.is_file():
+                raise StageUploadError(f"Staged local file does not exist: {file_path}")
+            snowflake_cursor.execute(
+                f"PUT '{file_uri}' @{stage} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+            )
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).casefold()
+            if "failed to upload files" in message or "file does not exist" in message:
+                if attempt < 2:
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                raise StageUploadError(str(exc)) from exc
+            raise
+    if last_error is not None:
+        raise last_error
     put_columns = [
         str(description[0]).casefold()
         for description in (snowflake_cursor.description or [])
@@ -220,6 +246,7 @@ def load_query_to_snowflake_in_batches(
     operation_error: BaseException | None = None
     transaction_started = False
     total_staged = 0
+    staging_temp_dir = Path(tempfile.mkdtemp(prefix=f"{stage_name}_"))
 
     try:
         snowflake_cursor.execute(
@@ -280,43 +307,45 @@ def load_query_to_snowflake_in_batches(
                     return 0
 
                 staged_filename = f"{stage_name}_{subset_tag}.json"
-                with tempfile.TemporaryDirectory(prefix=f"{stage_name}_{subset_tag}_") as temp_dir:
-                    file_path = Path(temp_dir) / staged_filename
-                    with file_path.open("w", encoding="utf-8", newline="") as output:
-                        json.dump(
-                            valid_records,
-                            output,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            allow_nan=False,
-                            default=_json_value,
+                file_path = staging_temp_dir / staged_filename
+                with file_path.open("w", encoding="utf-8", newline="") as output:
+                    json.dump(
+                        valid_records,
+                        output,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                        default=_json_value,
+                    )
+                    output.flush()
+                try:
+                    return _copy_staged_json_file(
+                        snowflake_cursor, stage, stage_table,
+                        staged_filename, file_path, len(valid_records),
+                    )
+                except StageUploadError:
+                    raise
+                except Exception as exc:
+                    if run_id and quarantine_invalid_rows and len(valid_records) > 1:
+                        midpoint = len(valid_records) // 2
+                        return (
+                            load_source_subset(valid_records[:midpoint], f"{subset_tag}_a")
+                            + load_source_subset(valid_records[midpoint:], f"{subset_tag}_b")
                         )
-                    try:
-                        return _copy_staged_json_file(
-                            snowflake_cursor, stage, stage_table,
-                            staged_filename, file_path, len(valid_records),
+                    if run_id and quarantine_invalid_rows and len(valid_records) == 1:
+                        record_quarantine(
+                            snowflake_cursor, database_name, schema_name, run_id,
+                            table_name, source_table, batch_number,
+                            valid_records[0], exc, target_columns,
                         )
-                    except Exception as exc:
-                        if run_id and quarantine_invalid_rows and len(valid_records) > 1:
-                            midpoint = len(valid_records) // 2
-                            return (
-                                load_source_subset(valid_records[:midpoint], f"{subset_tag}_a")
-                                + load_source_subset(valid_records[midpoint:], f"{subset_tag}_b")
-                            )
-                        if run_id and quarantine_invalid_rows and len(valid_records) == 1:
-                            record_quarantine(
-                                snowflake_cursor, database_name, schema_name, run_id,
-                                table_name, source_table, batch_number,
-                                valid_records[0], exc, target_columns,
-                            )
-                            snowflake_connection.commit()
-                            logger.error(
-                                "Quarantined invalid row for %s: %s",
-                                table_name,
-                                exc,
-                            )
-                            return 0
-                        raise
+                        snowflake_connection.commit()
+                        logger.error(
+                            "Quarantined invalid row for %s: %s",
+                            table_name,
+                            exc,
+                        )
+                        return 0
+                    raise
 
             while True:
                 rows = source_cursor.fetchmany(batch_size)
@@ -379,6 +408,7 @@ def load_query_to_snowflake_in_batches(
                 )
         raise
     finally:
+        shutil.rmtree(staging_temp_dir, ignore_errors=True)
         if stage_created:
             try:
                 snowflake_cursor.execute(f"DROP TABLE IF EXISTS {stage_table}")
