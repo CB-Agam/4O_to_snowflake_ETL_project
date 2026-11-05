@@ -4,9 +4,9 @@ import logging
 import json
 import tempfile
 import shutil
-import time
+import time as time_module
 from collections.abc import Callable
-from datetime import date, datetime, time
+from datetime import date, datetime, time as datetime_time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
@@ -28,7 +28,7 @@ class StageUploadError(RuntimeError):
 
 def _json_value(value: Any) -> Any:
     value = _clean_value(value)
-    if isinstance(value, (datetime, date, time)):
+    if isinstance(value, (datetime, date, datetime_time)):
         return value.isoformat()
     if isinstance(value, (Decimal, UUID)):
         return str(value)
@@ -65,7 +65,7 @@ def _copy_staged_json_file(
             message = str(exc).casefold()
             if "failed to upload files" in message or "file does not exist" in message:
                 if attempt < 2:
-                    time.sleep(1 * (attempt + 1))
+                    time_module.sleep(1 * (attempt + 1))
                     continue
                 raise StageUploadError(str(exc)) from exc
             raise
