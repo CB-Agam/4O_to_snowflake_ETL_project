@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pandas as pd
 
 from etl.ddl import build_create_table_sql
+from etl.quarantine import record_quarantine
 
 logger = logging.getLogger(__name__)
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
@@ -126,13 +127,21 @@ def _clean_value(value: Any) -> Any:
         return None
     if pd.isna(value):
         return None
+    if isinstance(value, pd.Timestamp):
+        stamp = value
+        if not 1 <= stamp.year <= 9999:
+            raise ValueError(f"year {stamp.year} is outside the supported timestamp range")
+        return stamp.to_pydatetime()
     if hasattr(value, "to_pydatetime"):
         try:
-            return value.to_pydatetime()
-        except Exception:
-            return value
-    if isinstance(value, pd.Timestamp):
-        return value.to_pydatetime()
+            stamp = value.to_pydatetime()
+        except Exception as exc:
+            raise ValueError(f"Invalid timestamp value {value!r}: {exc}") from exc
+        if not 1 <= stamp.year <= 9999:
+            raise ValueError(f"year {stamp.year} is outside the supported timestamp range")
+        return stamp
+    if isinstance(value, float):
+        return Decimal(str(value))
     return value
 
 
@@ -174,6 +183,9 @@ def load_query_to_snowflake_in_batches(
     target_columns: Sequence[str],
     batch_size: int = 50_000,
     before_publish: Callable[[], None] | None = None,
+    run_id: str | None = None,
+    source_table: str | None = None,
+    quarantine_invalid_rows: bool = True,
 ) -> int:
     if batch_size <= 0:
         raise ValueError("Batch size must be greater than zero")
@@ -224,53 +236,94 @@ def load_query_to_snowflake_in_batches(
         try:
             source_cursor.execute(query)
             batch_number = 0
+
+            def load_source_subset(subset: Sequence[Sequence[Any]], subset_tag: str) -> int:
+                valid_records: list[dict[str, Any]] = []
+                for row in subset:
+                    if isinstance(row, dict):
+                        valid_records.append(row)
+                        continue
+                    if len(row) != len(target_columns):
+                        exc = ValueError(
+                            f"Source row returned {len(row)} column(s); expected "
+                            f"{len(target_columns)} for {table_name}"
+                        )
+                        if run_id and quarantine_invalid_rows:
+                            record_quarantine(
+                                snowflake_cursor, database_name, schema_name, run_id,
+                                table_name, source_table, batch_number,
+                                {"raw_source_row": str(row)}, exc, target_columns,
+                            )
+                            snowflake_connection.commit()
+                            continue
+                        raise exc
+                    try:
+                        record = {
+                            column: _json_value(value)
+                            for column, value in zip(target_columns, row, strict=True)
+                            if column.upper() not in _ETL_TIMESTAMP_COLUMNS
+                        }
+                        json.dumps(record, ensure_ascii=False, allow_nan=False, default=_json_value)
+                        valid_records.append(record)
+                    except Exception as exc:
+                        if run_id and quarantine_invalid_rows:
+                            record_quarantine(
+                                snowflake_cursor, database_name, schema_name, run_id,
+                                table_name, source_table, batch_number,
+                                dict(zip(target_columns, row, strict=False)), exc, target_columns,
+                            )
+                            snowflake_connection.commit()
+                            continue
+                        raise
+
+                if not valid_records:
+                    return 0
+
+                staged_filename = f"{stage_name}_{subset_tag}.json"
+                with tempfile.TemporaryDirectory(prefix=f"{stage_name}_{subset_tag}_") as temp_dir:
+                    file_path = Path(temp_dir) / staged_filename
+                    with file_path.open("w", encoding="utf-8", newline="") as output:
+                        json.dump(
+                            valid_records,
+                            output,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                            default=_json_value,
+                        )
+                    try:
+                        return _copy_staged_json_file(
+                            snowflake_cursor, stage, stage_table,
+                            staged_filename, file_path, len(valid_records),
+                        )
+                    except Exception as exc:
+                        if run_id and quarantine_invalid_rows and len(valid_records) > 1:
+                            midpoint = len(valid_records) // 2
+                            return (
+                                load_source_subset(valid_records[:midpoint], f"{subset_tag}_a")
+                                + load_source_subset(valid_records[midpoint:], f"{subset_tag}_b")
+                            )
+                        if run_id and quarantine_invalid_rows and len(valid_records) == 1:
+                            record_quarantine(
+                                snowflake_cursor, database_name, schema_name, run_id,
+                                table_name, source_table, batch_number,
+                                valid_records[0], exc, target_columns,
+                            )
+                            snowflake_connection.commit()
+                            logger.error(
+                                "Quarantined invalid row for %s: %s",
+                                table_name,
+                                exc,
+                            )
+                            return 0
+                        raise
+
             while True:
                 rows = source_cursor.fetchmany(batch_size)
                 if not rows:
                     break
                 batch_number += 1
-                staged_filename = f"{stage_name}_{batch_number}.json"
-                with tempfile.TemporaryDirectory(
-                    prefix=f"{stage_name}_{batch_number}_"
-                ) as temp_dir:
-                    file_path = Path(temp_dir) / staged_filename
-                    with file_path.open("w", encoding="utf-8", newline="") as output:
-                        output.write("[")
-                        for row_index, row in enumerate(rows):
-                            if len(row) != len(target_columns):
-                                raise ValueError(
-                                    f"Source batch {batch_number} returned "
-                                    f"{len(row)} column(s); expected "
-                                    f"{len(target_columns)} for {table_name}"
-                                )
-                            if row_index:
-                                output.write(",")
-                            record = {
-                                column: _json_value(value)
-                                for column, value in zip(
-                                    target_columns,
-                                    row,
-                                    strict=True,
-                                )
-                                if column.upper() not in _ETL_TIMESTAMP_COLUMNS
-                            }
-                            json.dump(
-                                record,
-                                output,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                                allow_nan=False,
-                                default=_json_value,
-                            )
-                        output.write("]")
-                    loaded_rows = _copy_staged_json_file(
-                        snowflake_cursor,
-                        stage,
-                        stage_table,
-                        staged_filename,
-                        file_path,
-                        len(rows),
-                    )
+                loaded_rows = load_source_subset(rows, f"{batch_number}")
                 total_staged += loaded_rows
                 logger.info(
                     "Staged batch %s for %s: %s rows (%s total)",

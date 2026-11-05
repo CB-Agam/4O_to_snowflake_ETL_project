@@ -141,125 +141,164 @@ def run_for_table(
             try:
                 summary = []
                 for table_name, rows in selected_tables.items():
-                    source_rows = [
-                        row
-                        for row in rows
-                        if row["source_table"].strip()
-                        and row["source_column"].strip()
-                        and row["target_column"].strip()
-                    ]
-                    if not source_rows:
-                        raise ValueError(f"No complete source-to-target column mappings for table: {table_name}")
-
-                    source_table = source_rows[0]["source_table"]
-                    source_columns = [row["source_column"] for row in source_rows]
-                    target_columns = [row["target_column"] for row in source_rows]
-
-                    table_lock = audit.run_step(
-                        "ACQUIRE_TABLE_LOCK",
-                        lambda: acquire_table_run_lock(
-                            snowflake_cursor,
-                            snowflake_conn,
-                            settings.snowflake_database,
-                            settings.snowflake_schema,
-                            table_name,
-                            rows,
-                        ),
-                        table_name,
-                    )
                     try:
-                        exists = audit.run_step(
-                            "CHECK_TARGET_TABLE",
-                            lambda: table_exists_in_snowflake(
+                        source_rows = [
+                            row
+                            for row in rows
+                            if row["source_table"].strip()
+                            and row["source_column"].strip()
+                            and row["target_column"].strip()
+                        ]
+                        if not source_rows:
+                            raise ValueError(f"No complete source-to-target column mappings for table: {table_name}")
+
+                        source_table = source_rows[0]["source_table"]
+                        source_columns = [row["source_column"] for row in source_rows]
+                        target_columns = [row["target_column"] for row in source_rows]
+
+                        table_lock = audit.run_step(
+                            "ACQUIRE_TABLE_LOCK",
+                            lambda: acquire_table_run_lock(
                                 snowflake_cursor,
+                                snowflake_conn,
+                                settings.snowflake_database,
                                 settings.snowflake_schema,
                                 table_name,
+                                rows,
                             ),
                             table_name,
                         )
-                        if exists:
-                            audit.record(
-                                "CREATE_TARGET_TABLE",
-                                "SKIPPED",
-                                table_name,
-                                "Target table already exists",
-                            )
-                            audit.run_step(
-                                "DROP_STATUS_COLUMN",
-                                lambda: snowflake_cursor.execute(
-                                    build_drop_status_column_sql(
-                                        table_name,
-                                        schema_name=settings.snowflake_schema,
-                                    )
+                        try:
+                            exists = audit.run_step(
+                                "CHECK_TARGET_TABLE",
+                                lambda: table_exists_in_snowflake(
+                                    snowflake_cursor,
+                                    settings.snowflake_schema,
+                                    table_name,
                                 ),
                                 table_name,
                             )
-                            for statement in build_widen_clob_columns_sql(
-                                table_name,
-                                rows,
-                                schema_name=settings.snowflake_schema,
-                            ):
+                            if exists:
+                                audit.record(
+                                    "CREATE_TARGET_TABLE",
+                                    "SKIPPED",
+                                    table_name,
+                                    "Target table already exists",
+                                )
                                 audit.run_step(
-                                    "WIDEN_CLOB_COLUMN",
-                                    lambda statement=statement: snowflake_cursor.execute(statement),
+                                    "DROP_STATUS_COLUMN",
+                                    lambda: snowflake_cursor.execute(
+                                        build_drop_status_column_sql(
+                                            table_name,
+                                            schema_name=settings.snowflake_schema,
+                                        )
+                                    ),
                                     table_name,
                                 )
-                            for statement in build_timestamp_column_sql(
-                                table_name,
-                                rows,
-                                schema_name=settings.snowflake_schema,
-                            ):
+                                for statement in build_widen_clob_columns_sql(
+                                    table_name,
+                                    rows,
+                                    schema_name=settings.snowflake_schema,
+                                ):
+                                    audit.run_step(
+                                        "WIDEN_CLOB_COLUMN",
+                                        lambda statement=statement: snowflake_cursor.execute(statement),
+                                        table_name,
+                                    )
+                                for statement in build_timestamp_column_sql(
+                                    table_name,
+                                    rows,
+                                    schema_name=settings.snowflake_schema,
+                                ):
+                                    audit.run_step(
+                                        "ENFORCE_TIMESTAMP_COLUMN",
+                                        lambda statement=statement: snowflake_cursor.execute(statement),
+                                        table_name,
+                                    )
+                            else:
                                 audit.run_step(
-                                    "ENFORCE_TIMESTAMP_COLUMN",
-                                    lambda statement=statement: snowflake_cursor.execute(statement),
+                                    "CREATE_TARGET_TABLE",
+                                    lambda: snowflake_cursor.execute(
+                                        build_create_table_sql(
+                                            table_name,
+                                            rows,
+                                            schema_name=settings.snowflake_schema,
+                                        )
+                                    ),
                                     table_name,
                                 )
-                        else:
-                            audit.run_step(
-                                "CREATE_TARGET_TABLE",
-                                lambda: snowflake_cursor.execute(
-                                    build_create_table_sql(
+
+                            if incremental:
+                                result = audit.run_step(
+                                    "INCREMENTAL_LOAD",
+                                    lambda: incremental_load_table(
+                                        fourd_conn,
+                                        snowflake_conn,
+                                        snowflake_cursor,
+                                        settings.snowflake_database,
+                                        settings.snowflake_schema,
                                         table_name,
                                         rows,
-                                        schema_name=settings.snowflake_schema,
-                                    )
-                                ),
-                                table_name,
-                            )
+                                        audit.run_id,
+                                        overlap_seconds=overlap_seconds,
+                                        table_lock=table_lock,
+                                    ),
+                                    table_name,
+                                )
+                                summary.append(
+                                    {
+                                        "table": table_name,
+                                        "source_table": source_table,
+                                        "source_columns": source_columns,
+                                        "target_columns": target_columns,
+                                        **result,
+                                    }
+                                )
+                                continue
 
-                        if incremental:
-                            result = audit.run_step(
-                                "INCREMENTAL_LOAD",
-                                lambda: incremental_load_table(
+                            query = build_source_query(source_table, source_columns)
+                            def renew_lock_before_publish() -> None:
+                                audit.run_step(
+                                    "RENEW_TABLE_LOCK",
+                                    lambda: renew_table_run_lock(
+                                        snowflake_cursor,
+                                        snowflake_conn,
+                                        table_lock,
+                                        table_name,
+                                    ),
+                                    table_name,
+                                )
+
+                            inserted = audit.run_step(
+                                "BATCHED_BULK_LOAD",
+                                lambda: load_query_to_snowflake_in_batches(
                                     fourd_conn,
                                     snowflake_conn,
                                     snowflake_cursor,
+                                    query,
                                     settings.snowflake_database,
                                     settings.snowflake_schema,
                                     table_name,
-                                    rows,
-                                    audit.run_id,
-                                    overlap_seconds=overlap_seconds,
-                                    table_lock=table_lock,
+                                    target_columns,
+                                    batch_size=batch_size,
+                                    before_publish=renew_lock_before_publish,
+                                    run_id=audit.run_id,
+                                    source_table=source_table,
+                                    quarantine_invalid_rows=True,
                                 ),
                                 table_name,
                             )
-                            summary.append(
-                                {
-                                    "table": table_name,
-                                    "source_table": source_table,
-                                    "source_columns": source_columns,
-                                    "target_columns": target_columns,
-                                    **result,
-                                }
-                            )
-                            continue
-
-                        query = build_source_query(source_table, source_columns)
-                        def renew_lock_before_publish() -> None:
+                            summary.append({
+                                "table": table_name,
+                                "source_table": source_table,
+                                "source_columns": source_columns,
+                                "target_columns": target_columns,
+                                "rows_loaded": inserted,
+                            })
+                        finally:
                             audit.run_step(
-                                "RENEW_TABLE_LOCK",
-                                lambda: renew_table_run_lock(
+                                "RELEASE_TABLE_LOCK",
+                                lambda: release_table_run_lock(
                                     snowflake_cursor,
                                     snowflake_conn,
                                     table_lock,
@@ -268,40 +307,10 @@ def run_for_table(
                                 table_name,
                             )
 
-                        inserted = audit.run_step(
-                            "BATCHED_BULK_LOAD",
-                            lambda: load_query_to_snowflake_in_batches(
-                                fourd_conn,
-                                snowflake_conn,
-                                snowflake_cursor,
-                                query,
-                                settings.snowflake_database,
-                                settings.snowflake_schema,
-                                table_name,
-                                target_columns,
-                                batch_size=batch_size,
-                                before_publish=renew_lock_before_publish,
-                            ),
-                            table_name,
-                        )
-                        summary.append({
-                            "table": table_name,
-                            "source_table": source_table,
-                            "source_columns": source_columns,
-                            "target_columns": target_columns,
-                            "rows_loaded": inserted,
-                        })
-                    finally:
-                        audit.run_step(
-                            "RELEASE_TABLE_LOCK",
-                            lambda: release_table_run_lock(
-                                snowflake_cursor,
-                                snowflake_conn,
-                                table_lock,
-                                table_name,
-                            ),
-                            table_name,
-                        )
+                    except Exception as exc:
+                        logger.exception('Table ETL failed for %s', table_name)
+                        summary.append({'table': table_name, 'status': 'FAILED', 'error': str(exc)})
+                        audit.record('TABLE_LOAD', 'FAILED', table_name, str(exc))
             finally:
                 audit.run_step("CLOSE_4D_CONNECTION", fourd_conn.close, audit_table_name)
         finally:
@@ -310,12 +319,16 @@ def run_for_table(
                 snowflake_cursor.close,
                 audit_table_name,
             )
+        failed_tables = [item for item in summary if item.get("status") == "FAILED"]
+        pipeline_status = "PARTIAL" if failed_tables else "SUCCESS"
         audit.finish_step(
             pipeline_step_number,
-            "SUCCESS",
+            pipeline_status,
             "; ".join(
                 (
-                    f"No changes for {item['table']}"
+                    f"Table {item['table']} failed: {item['error']}"
+                    if item.get("status") == "FAILED"
+                    else f"No changes for {item['table']}"
                     if item.get("status") == "NO_CHANGE"
                     else f"Loaded {item['rows_loaded']} rows into {item['table']}"
                 )
@@ -468,8 +481,12 @@ def main() -> int:
             overlap_seconds=args.overlap_seconds,
             batch_size=args.batch_size,
         )
+        failed_count = 0
         for item in result["tables"]:
-            if item.get("status") == "NO_CHANGE":
+            if item.get("status") == "FAILED":
+                failed_count += 1
+                message = f"Table {item['table']} failed: {item['error']}"
+            elif item.get("status") == "NO_CHANGE":
                 message = f"No changes detected for {item['table']}"
             else:
                 message = (
@@ -479,6 +496,9 @@ def main() -> int:
             logger.info(message)
             print(message)
 
+        if failed_count:
+            logger.warning("ETL run completed with %s failed table(s)", failed_count)
+            return 1
         logger.info("ETL run completed successfully")
         return 0
     except Exception:
