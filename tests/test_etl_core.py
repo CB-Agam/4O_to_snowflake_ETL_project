@@ -19,6 +19,7 @@ from config.settings import Settings
 from connections.fourd_connection import connect_to_4d
 from connections.snowflake_connection import connect_to_snowflake
 from etl.load import (
+    _snowflake_stage_file_uri,
     build_insert_sql,
     build_source_query,
     load_dataframe_to_snowflake,
@@ -762,6 +763,13 @@ class EtlCoreTests(unittest.TestCase):
             sql,
         )
         self.assertEqual(rows, [("Example",)])
+
+    def test_snowflake_stage_file_uri_uses_windows_compatible_scheme(self):
+        path = Path(r"C:\Users\agamdev\AppData\Local\Temp\ETL_STAGE_123\ETL_STAGE_123_1.json")
+        self.assertEqual(
+            _snowflake_stage_file_uri(path),
+            "file://C:/Users/agamdev/AppData/Local/Temp/ETL_STAGE_123/ETL_STAGE_123_1.json",
+        )
 
     def test_batched_load_stages_chunks_and_publishes_atomically(self):
         source_cursor = Mock()

@@ -68,6 +68,19 @@ class StageUploadError(RuntimeError):
     """Local file could not be uploaded; do not treat this as source-row data."""
 
 
+def _snowflake_stage_file_uri(file_path: Path) -> str:
+    """Render a path in the format Snowflake expects for PUT statements.
+
+    Python's ``Path.as_uri()`` yields ``file:///C:/...`` on Windows, but the
+    Snowflake connector strips the ``file://`` prefix before checking the local
+    path. That makes ``/C:/...`` look like a different file and triggers the
+    'File does not exist' error seen in Windows ETL runs.
+    """
+    normalized = file_path.resolve()
+    posix_path = normalized.as_posix().replace("\\", "/")
+    return f"file://{posix_path}".replace("'", "''")
+
+
 def _json_value(value: Any) -> Any:
     value = _clean_value(value)
     if isinstance(value, (datetime, date, datetime_time)):
@@ -89,7 +102,7 @@ def _copy_staged_json_file(
     file_path: Path,
     expected_rows: int,
 ) -> int:
-    file_uri = file_path.resolve().as_uri().replace("'", "''")
+    file_uri = _snowflake_stage_file_uri(file_path)
     if not file_path.is_file():
         raise StageUploadError(f"Staged local file does not exist: {file_path}")
     last_error: Exception | None = None

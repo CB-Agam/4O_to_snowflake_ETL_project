@@ -9,7 +9,12 @@ from uuid import UUID
 
 import simplejson as json
 
-from etl.load import build_source_query, create_missing_tables_from_metadata, table_exists_in_snowflake
+from etl.load import (
+    _snowflake_stage_file_uri,
+    build_source_query,
+    create_missing_tables_from_metadata,
+    table_exists_in_snowflake,
+)
 from etl.sftp_snowpipe import (
     create_batch_audit_table,
     finish_batch_audit,
@@ -180,7 +185,7 @@ def publish_json_snapshot(
                 f"JSON mapping produced {transformed_rows} row(s), but 4D extraction produced {expected_rows}"
             )
 
-        source_uri = transformed_path.resolve().as_uri().replace("'", "''")
+        source_uri = _snowflake_stage_file_uri(transformed_path)
         cursor.execute(
             f"PUT '{source_uri}' @{stage_name} "
             "AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
