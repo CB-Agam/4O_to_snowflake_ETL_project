@@ -19,6 +19,38 @@ from etl.quarantine import record_quarantine
 
 logger = logging.getLogger(__name__)
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
+
+
+def _record_quarantine_on_connection(
+    snowflake_connection,
+    database_name: str,
+    schema_name: str,
+    run_id: str,
+    target_table: str,
+    source_table: str | None,
+    batch_number: int,
+    record: dict[str, Any],
+    error: BaseException | str,
+    target_columns: Sequence[str],
+) -> None:
+    quarantine_cursor = snowflake_connection.cursor()
+    try:
+        record_quarantine(
+            quarantine_cursor,
+            database_name,
+            schema_name,
+            run_id,
+            target_table,
+            source_table,
+            batch_number,
+            record,
+            error,
+            target_columns,
+        )
+        snowflake_connection.commit()
+    finally:
+        quarantine_cursor.close()
+
 _CURRENT_TIMESTAMP_NTZ = "CURRENT_TIMESTAMP()::TIMESTAMP_NTZ"
 
 
@@ -151,13 +183,19 @@ def build_insert_sql(table_name: str, target_columns: Sequence[str], schema_name
 def _clean_value(value: Any) -> Any:
     if value is None:
         return None
-    if pd.isna(value):
-        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception as exc:
+        raise ValueError(f"Could not inspect source value {value!r}: {exc}") from exc
     if isinstance(value, pd.Timestamp):
-        stamp = value
-        if not 1 <= stamp.year <= 9999:
-            raise ValueError(f"year {stamp.year} is outside the supported timestamp range")
-        return stamp.to_pydatetime()
+        try:
+            stamp = value
+            if not 1 <= stamp.year <= 9999:
+                raise ValueError(f"year {stamp.year} is outside the supported timestamp range")
+            return stamp.to_pydatetime()
+        except Exception as exc:
+            raise ValueError(f"Invalid timestamp value {value!r}: {exc}") from exc
     if hasattr(value, "to_pydatetime"):
         try:
             stamp = value.to_pydatetime()
@@ -276,12 +314,11 @@ def load_query_to_snowflake_in_batches(
                             f"{len(target_columns)} for {table_name}"
                         )
                         if run_id and quarantine_invalid_rows:
-                            record_quarantine(
-                                snowflake_cursor, database_name, schema_name, run_id,
+                            _record_quarantine_on_connection(
+                                snowflake_connection, database_name, schema_name, run_id,
                                 table_name, source_table, batch_number,
                                 {"raw_source_row": str(row)}, exc, target_columns,
                             )
-                            snowflake_connection.commit()
                             continue
                         raise exc
                     try:
@@ -294,12 +331,11 @@ def load_query_to_snowflake_in_batches(
                         valid_records.append(record)
                     except Exception as exc:
                         if run_id and quarantine_invalid_rows:
-                            record_quarantine(
-                                snowflake_cursor, database_name, schema_name, run_id,
+                            _record_quarantine_on_connection(
+                                snowflake_connection, database_name, schema_name, run_id,
                                 table_name, source_table, batch_number,
                                 dict(zip(target_columns, row, strict=False)), exc, target_columns,
                             )
-                            snowflake_connection.commit()
                             continue
                         raise
 
@@ -333,12 +369,11 @@ def load_query_to_snowflake_in_batches(
                             + load_source_subset(valid_records[midpoint:], f"{subset_tag}_b")
                         )
                     if run_id and quarantine_invalid_rows and len(valid_records) == 1:
-                        record_quarantine(
-                            snowflake_cursor, database_name, schema_name, run_id,
+                        _record_quarantine_on_connection(
+                            snowflake_connection, database_name, schema_name, run_id,
                             table_name, source_table, batch_number,
                             valid_records[0], exc, target_columns,
                         )
-                        snowflake_connection.commit()
                         logger.error(
                             "Quarantined invalid row for %s: %s",
                             table_name,
