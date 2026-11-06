@@ -15,6 +15,7 @@ from uuid import uuid4
 import pandas as pd
 
 from etl.load import build_source_query, load_dataframe_to_snowflake
+from etl.quarantine import record_quarantine
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,52 @@ def _normalize_optional_timestamp(value: Any, key: str) -> datetime | None:
     return _normalize_timestamp(value, key)
 
 
+def quarantine_invalid_incremental_rows(
+    dataframe: pd.DataFrame,
+    strategy: dict[str, Any],
+    snowflake_cursor,
+    snowflake_connection,
+    database: str,
+    schema: str,
+    table_name: str,
+    source_table: str,
+    run_id: str,
+    metadata_rows: Sequence[dict[str, str]],
+) -> pd.DataFrame:
+    timestamp_columns = [
+        strategy.get("modified_target_column")
+    ]
+    if strategy.get("created_target_column"):
+        timestamp_columns.append(strategy.get("created_target_column"))
+
+    valid_rows = []
+    for _, row in dataframe.iterrows():
+        try:
+            for column in timestamp_columns:
+                if column:
+                    _normalize_optional_timestamp(row[column], column)
+            valid_rows.append(row)
+        except BaseException as exc:
+            record_quarantine(
+                snowflake_cursor,
+                database,
+                schema,
+                run_id,
+                table_name,
+                source_table,
+                0,
+                row.to_dict(),
+                exc,
+                [item["target_column"] for item in metadata_rows if item.get("target_column")],
+            )
+            snowflake_connection.commit()
+            logger.error("Quarantined invalid incremental timestamp row for %s: %s", table_name, exc)
+
+    if not valid_rows:
+        return dataframe.iloc[0:0].copy()
+    return pd.DataFrame(valid_rows, columns=dataframe.columns)
+
+
 def _source_projection_query(source_table: str, columns: Sequence[str]) -> str:
     return build_source_query(source_table, columns)
 
@@ -304,6 +351,11 @@ def _discover_timestamp_changes(
     state_by_key: dict[str, tuple[str | None, datetime | None]],
     watermark: datetime | None,
     overlap_seconds: int,
+    snowflake_cursor=None,
+    snowflake_connection=None,
+    database: str | None = None,
+    schema: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[
     pd.DataFrame,
     list[tuple[str, str, str | None, datetime | None]],
@@ -352,10 +404,21 @@ def _discover_timestamp_changes(
             raise ValueError(
                 f"Declared 4D key {key_source!r} is not unique in source table {source_table}"
             )
-        keyed_timestamps[key] = (
-            raw_key,
-            _normalize_optional_timestamp(raw_timestamp, modified_source),
-        )
+        try:
+            normalized_timestamp = _normalize_optional_timestamp(raw_timestamp, modified_source)
+        except BaseException as exc:
+            if run_id and snowflake_cursor is not None:
+                record_quarantine(
+                    snowflake_cursor, database, schema, run_id, table_name, source_table,
+                    0,
+                    {key_source: raw_key, modified_source: raw_timestamp},
+                    exc, rows,
+                )
+                snowflake_connection.commit()
+            else:
+                raise
+            continue
+        keyed_timestamps[key] = (raw_key, normalized_timestamp)
 
     threshold = (
         watermark - timedelta(seconds=overlap_seconds)
@@ -855,6 +918,19 @@ def incremental_load_table(
             if len(initial_df.columns) != len(target_columns):
                 raise ValueError(f"Initial extraction returned unexpected columns for {table_name}")
             initial_df.columns = target_columns
+            source_table_name = next(iter(source_tables))
+            initial_df = quarantine_invalid_incremental_rows(
+                initial_df,
+                strategy,
+                snowflake_cursor,
+                snowflake_connection,
+                database,
+                schema,
+                table_name,
+                source_table_name,
+                run_id,
+                metadata_rows,
+            )
             new_state = _rows_as_state(
                 initial_df,
                 table_name,
@@ -892,6 +968,11 @@ def incremental_load_table(
                     old_state,
                     old_watermark,
                     overlap_seconds,
+                    snowflake_cursor,
+                    snowflake_connection,
+                    database,
+                    schema,
+                    run_id,
                 )
             )
             counts["source_scan"] = source_count
