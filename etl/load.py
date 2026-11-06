@@ -68,6 +68,40 @@ class StageUploadError(RuntimeError):
     """Local file could not be uploaded; do not treat this as source-row data."""
 
 
+def _normalize_source_timestamp(value: Any, column: str) -> Any:
+    if column.strip().upper().replace(" ", "_").replace("-", "_") not in _SOURCE_RAW_TIMESTAMP_COLUMNS:
+        return _clean_value(value)
+
+    cleaned = _clean_value(value)
+    if cleaned is None:
+        return None
+    if isinstance(cleaned, datetime):
+        if not 1 <= cleaned.year <= 9999:
+            raise ValueError(f"year {cleaned.year} is outside the supported timestamp range")
+        return cleaned.isoformat()
+    if isinstance(cleaned, (date, datetime_time)):
+        return cleaned.isoformat()
+    if not isinstance(cleaned, str):
+        return _json_value(cleaned)
+
+    raw = cleaned.strip()
+    if not raw:
+        return None
+    for date_format in (
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            parsed = datetime.strptime(raw, date_format)
+            return parsed.isoformat()
+        except ValueError:
+            pass
+    raise ValueError(f"Invalid source timestamp for {column}: {raw!r}")
+
+
 def _json_value(value: Any) -> Any:
     value = _clean_value(value)
     if isinstance(value, (datetime, date, datetime_time)):
@@ -342,7 +376,7 @@ def load_query_to_snowflake_in_batches(
                         raise exc
                     try:
                         record = {
-                            column: _json_value(value)
+                            column: _normalize_source_timestamp(value, column)
                             for column, value in zip(target_columns, row, strict=True)
                             if column.upper() not in _ETL_TIMESTAMP_COLUMNS
                         }

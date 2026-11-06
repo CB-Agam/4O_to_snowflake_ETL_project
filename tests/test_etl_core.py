@@ -23,6 +23,7 @@ from etl.load import (
     build_source_query,
     load_dataframe_to_snowflake,
     load_query_to_snowflake_in_batches,
+    _normalize_source_timestamp,
 )
 from scripts import run_initial_etl
 from scripts.run_initial_etl import _parse_args
@@ -888,6 +889,20 @@ class EtlCoreTests(unittest.TestCase):
             "SELECT [Cheque_ID_No], [Cheque Date], [Name ]] With Bracket] "
             "FROM [Acc_Cheque_Payments]",
         )
+
+    def test_normalize_source_timestamp_accepts_4d_day_first_format(self):
+        self.assertEqual(
+            _normalize_source_timestamp("20/03/2006 00:00:00", "CREATED_ON"),
+            "2006-03-20T00:00:00",
+        )
+        self.assertEqual(
+            _normalize_source_timestamp("22/03/2006 00:00:00", "MODIFIED_ON"),
+            "2006-03-22T00:00:00",
+        )
+
+    def test_normalize_source_timestamp_quarantines_out_of_range_year(self):
+        with self.assertRaisesRegex(ValueError, "Invalid source timestamp"):
+            _normalize_source_timestamp("01/01/13698 00:00:00", "CREATED_ON")
 
     def test_build_source_query_casts_timestamp_columns_to_raw_text(self):
         query = build_source_query(
