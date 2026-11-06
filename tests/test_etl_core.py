@@ -889,6 +889,18 @@ class EtlCoreTests(unittest.TestCase):
             "FROM [Acc_Cheque_Payments]",
         )
 
+    def test_build_source_query_casts_timestamp_columns_to_raw_text(self):
+        query = build_source_query(
+            "Claims Trans",
+            ["CLAIM_ID", "CREATED_ON", "MODIFIED_ON"],
+        )
+
+        self.assertEqual(
+            query,
+            "SELECT [CLAIM_ID], CAST([CREATED_ON] AS VARCHAR), "
+            "CAST([MODIFIED_ON] AS VARCHAR) FROM [Claims Trans]",
+        )
+
     def test_build_create_table_sql_includes_primary_key(self):
         rows = [
             {

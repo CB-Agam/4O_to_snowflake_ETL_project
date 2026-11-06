@@ -19,6 +19,16 @@ from etl.quarantine import record_quarantine
 
 logger = logging.getLogger(__name__)
 _ETL_TIMESTAMP_COLUMNS = ("CREATED_TIMESTAMP", "UPDATED_TIMESTAMP")
+_SOURCE_RAW_TIMESTAMP_COLUMNS = {
+    "CREATED_ON",
+    "MODIFIED_ON",
+    "CREATED_DATE",
+    "MODIFIED_DATE",
+    "CREATED_TIMESTAMP",
+    "MODIFIED_TIMESTAMP",
+    "UPDATED_ON",
+    "UPDATED_TIMESTAMP",
+}
 
 
 def _record_quarantine_on_connection(
@@ -159,8 +169,17 @@ def build_source_query(source_table: str, source_columns: Sequence[str]) -> str:
     def quote_identifier(identifier: str) -> str:
         return "[" + identifier.replace("]", "]]") + "]"
 
-    quoted_columns = ", ".join(quote_identifier(column) for column in columns)
-    return f"SELECT {quoted_columns} FROM {quote_identifier(source_table.strip())}"
+    def source_expression(column: str) -> str:
+        normalized = column.strip().upper().replace(" ", "_").replace("-", "_")
+        if normalized in _SOURCE_RAW_TIMESTAMP_COLUMNS:
+            # Fetch source timestamps as text. 4D/ODBC otherwise converts invalid
+            # years (for example 13698) while fetchmany() runs and hides the row
+            # from Python so it cannot be quarantined.
+            return f"CAST({quote_identifier(column)} AS VARCHAR)"
+        return quote_identifier(column)
+
+    selected_columns = ", ".join(source_expression(column) for column in columns)
+    return f"SELECT {selected_columns} FROM {quote_identifier(source_table.strip())}"
 
 
 def build_insert_sql(table_name: str, target_columns: Sequence[str], schema_name: str | None = None) -> str:
@@ -383,7 +402,48 @@ def load_query_to_snowflake_in_batches(
                     raise
 
             while True:
-                rows = source_cursor.fetchmany(batch_size)
+                try:
+                    rows = source_cursor.fetchmany(batch_size)
+                except Exception as fetch_error:
+                    logger.error(
+                        "Source batch fetch failed for %s; retrying row-by-row: %s",
+                        table_name,
+                        fetch_error,
+                    )
+                    fallback_rows: list[Sequence[Any]] = []
+                    row_failures = 0
+                    while True:
+                        try:
+                            rows_one = source_cursor.fetchmany(1)
+                        except Exception as row_error:
+                            row_failures += 1
+                            if run_id and quarantine_invalid_rows:
+                                _record_quarantine_on_connection(
+                                    snowflake_connection,
+                                    database_name,
+                                    schema_name,
+                                    run_id,
+                                    table_name,
+                                    source_table,
+                                    batch_number + 1,
+                                    {"SOURCE_FETCH_POSITION": row_failures},
+                                    row_error,
+                                    target_columns,
+                                )
+                            if row_failures >= batch_size:
+                                break
+                            continue
+                        if not rows_one:
+                            break
+                        fallback_rows.extend(rows_one)
+                        if len(fallback_rows) >= batch_size:
+                            break
+                    if not fallback_rows and not row_failures:
+                        raise
+                    rows = fallback_rows
+                    if not rows:
+                        continue
+
                 if not rows:
                     break
                 batch_number += 1
