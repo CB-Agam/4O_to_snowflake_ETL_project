@@ -1,3 +1,4 @@
+import os
 import logging
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ from etl.load import (
     build_source_query,
     load_dataframe_to_snowflake,
     load_query_to_snowflake_in_batches,
+    _local_file_uri,
     _normalize_source_timestamp,
 )
 from scripts import run_initial_etl
@@ -890,6 +892,15 @@ class EtlCoreTests(unittest.TestCase):
             "FROM [Acc_Cheque_Payments]",
         )
 
+    def test_local_file_uri_preserves_windows_drive_letter(self):
+        file_path = Path(tempfile.gettempdir()) / "etl_stage.json"
+
+        uri = _local_file_uri(file_path)
+
+        if os.name == "nt":
+            self.assertRegex(uri, r"^file://[A-Za-z]:/")
+            self.assertNotRegex(uri, r"^file:///")
+
     def test_normalize_source_timestamp_accepts_4d_day_first_format(self):
         self.assertEqual(
             _normalize_source_timestamp("20/03/2006 00:00:00", "CREATED_ON"),
@@ -898,6 +909,10 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(
             _normalize_source_timestamp("22/03/2006 00:00:00", "MODIFIED_ON"),
             "2006-03-22T00:00:00",
+        )
+        self.assertEqual(
+            _normalize_source_timestamp("20/03/2006 00:00:00.000", "CREATED_ON"),
+            "2006-03-20T00:00:00",
         )
 
     def test_normalize_source_timestamp_quarantines_out_of_range_year(self):

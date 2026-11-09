@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import tempfile
 import shutil
 import time as time_module
@@ -68,6 +69,13 @@ class StageUploadError(RuntimeError):
     """Local file could not be uploaded; do not treat this as source-row data."""
 
 
+def _local_file_uri(file_path: Path) -> str:
+    resolved_path = file_path.resolve()
+    if os.name == "nt":
+        return f"file://{resolved_path.as_posix()}"
+    return resolved_path.as_uri()
+
+
 def _normalize_source_timestamp(value: Any, column: str) -> Any:
     if column.strip().upper().replace(" ", "_").replace("-", "_") not in _SOURCE_RAW_TIMESTAMP_COLUMNS:
         return _clean_value(value)
@@ -88,7 +96,9 @@ def _normalize_source_timestamp(value: Any, column: str) -> Any:
     if not raw:
         return None
     for date_format in (
+        "%d/%m/%Y %H:%M:%S.%f",
         "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %I:%M:%S %p",
         "%d/%m/%Y",
         "%Y-%m-%d %H:%M:%S.%f",
         "%Y-%m-%d %H:%M:%S",
@@ -123,7 +133,7 @@ def _copy_staged_json_file(
     file_path: Path,
     expected_rows: int,
 ) -> int:
-    file_uri = file_path.resolve().as_uri().replace("'", "''")
+    file_uri = _local_file_uri(file_path).replace("'", "''")
     if not file_path.is_file():
         raise StageUploadError(f"Staged local file does not exist: {file_path}")
     last_error: Exception | None = None
@@ -359,7 +369,22 @@ def load_query_to_snowflake_in_batches(
                 valid_records: list[dict[str, Any]] = []
                 for row in subset:
                     if isinstance(row, dict):
-                        valid_records.append(row)
+                        try:
+                            normalized_record = {
+                                column: _normalize_source_timestamp(value, column)
+                                for column, value in row.items()
+                                if column.upper() not in _ETL_TIMESTAMP_COLUMNS
+                            }
+                            json.dumps(normalized_record, ensure_ascii=False, allow_nan=False, default=_json_value)
+                            valid_records.append(normalized_record)
+                        except Exception as exc:
+                            if run_id and quarantine_invalid_rows:
+                                _record_quarantine_on_connection(
+                                    snowflake_connection, database_name, schema_name, run_id,
+                                    table_name, source_table, batch_number, row, exc, target_columns,
+                                )
+                                continue
+                            raise
                         continue
                     if len(row) != len(target_columns):
                         exc = ValueError(
