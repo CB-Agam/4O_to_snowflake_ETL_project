@@ -205,7 +205,11 @@ def get_table_rows(metadata: Dict[str, List[Dict[str, str]]], table_name: str) -
     return metadata.get(normalized_name, [])
 
 
-def build_source_query(source_table: str, source_columns: Sequence[str]) -> str:
+def build_source_query(
+    source_table: str,
+    source_columns: Sequence[str],
+    raw_text_columns: Sequence[str] = (),
+) -> str:
     columns = [str(column).strip() for column in source_columns if str(column).strip()]
     if not columns:
         raise ValueError(f"No source columns provided for table: {source_table}")
@@ -213,9 +217,17 @@ def build_source_query(source_table: str, source_columns: Sequence[str]) -> str:
     def quote_identifier(identifier: str) -> str:
         return "[" + identifier.replace("]", "]]") + "]"
 
+    raw_text_column_names = {
+        str(column).strip().upper().replace(" ", "_").replace("-", "_")
+        for column in raw_text_columns
+    }
+
     def source_expression(column: str) -> str:
         normalized = column.strip().upper().replace(" ", "_").replace("-", "_")
-        if normalized in _SOURCE_RAW_TIMESTAMP_COLUMNS:
+        if (
+            normalized in _SOURCE_RAW_TIMESTAMP_COLUMNS
+            or normalized in raw_text_column_names
+        ):
             # Fetch source timestamps as text. 4D/ODBC otherwise converts invalid
             # years (for example 13698) while fetchmany() runs and hides the row
             # from Python so it cannot be quarantined.

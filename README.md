@@ -55,6 +55,91 @@ batch size when needed:
 py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 ```
 
+## Single-file Parquet end-to-end ETL
+
+Run the complete export, raw load, and typed transform flow with one command.
+The existing `run_initial_etl.py` command remains unchanged.
+
+```powershell
+.\env_etl\Scripts\python.exe scripts\run_parquet_etl.py `
+  --table "User_Defined_Form_Builds" `
+  --fetch-size 50000 `
+  --export-dir exports
+```
+
+For multiple tables, pass their mapping worksheet/table names. Processing
+continues after an individual table fails, and the command exits with code 1
+if any table failed:
+
+```powershell
+.\env_etl\Scripts\python.exe scripts\run_parquet_etl.py `
+  --tables "Account Contacts" "User_Defined_Form_Builds" `
+  --fetch-size 50000 `
+  --export-dir exports
+```
+
+The runner uses one 4D connection, one Snowflake connection, and one run ID
+for all selected tables. Each table gets one completed Parquet file, is loaded
+into its `<TARGET_TABLE>_RAW` VARCHAR landing table, and then has valid rows
+published to the mapped target. Raw rows stay available for correction;
+invalid mapped values are recorded in `ETL_DATA_QUALITY_ERRORS`. Existing
+target snapshots are preserved under generated `<TARGET_TABLE>_HIST_<ID>`
+names. Per-table extraction, load, transform, row counts, file details, and
+errors are recorded in `ETL_PIPELINE_LOG`; load and transform details are also
+tracked in `ETL_PARQUET_FILE_LOADS`.
+
+The runner uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` from `.env`; pass
+`--database` and `--schema` to override them. The mapping worksheet is inferred
+from each table name. For a single table with a differently named worksheet,
+pass `--sheet "Worksheet Name"`.
+
+To run each stage separately (for example, when resuming from an already
+completed export), use the commands below.
+
+The individual commands together export one complete table from 4D to one
+local Parquet file, upload and copy it into a Snowflake raw landing table, and
+transform valid values into the mapped production table.
+The Snowflake command writes to `<TARGET_TABLE>_RAW`, where mapped data fields
+are `VARCHAR` so source values remain available for validation and cleansing.
+The transform command publishes a full snapshot of valid rows and records
+conversion failures in `ETL_DATA_QUALITY_ERRORS`. If a target already exists,
+the previous snapshot is preserved under a generated `<TARGET_TABLE>_HIST_<ID>`
+name.
+
+For `User_Defined_Form_Builds`, run from the repository root in PowerShell:
+
+```powershell
+$runId = [guid]::NewGuid().ToString()
+.\env_etl\Scripts\python.exe scripts\export_table_to_parquet.py `
+  --table "User_Defined_Form_Builds" `
+  --sheet "User_Defined_Form_Builds" `
+  --fetch-size 50000 `
+  --export-dir exports `
+  --run-id $runId
+
+$parquetFile = "exports\USER_DEFINED_FORM_BUILDS\$runId\user_defined_form_builds.parquet"
+.\env_etl\Scripts\python.exe scripts\load_parquet_to_snowflake.py `
+  --table "User_Defined_Form_Builds" `
+  --sheet "User_Defined_Form_Builds" `
+  --file $parquetFile
+
+.\env_etl\Scripts\python.exe scripts\transform_parquet_raw.py `
+  --table "User_Defined_Form_Builds" `
+  --sheet "User_Defined_Form_Builds" `
+  --file $parquetFile
+```
+
+The load command uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` from `.env`
+unless `--database` and `--schema` are supplied. It creates/reuses an internal
+stage, a `USER_DEFINED_FORM_BUILDS_RAW` landing table, and the
+`ETL_PARQUET_FILE_LOADS` file ledger. It verifies Parquet metadata and COPY row
+counts, records the file SHA-256 to prevent reloading the same successful file,
+and keeps raw date/numeric values as text for subsequent validation. The
+transform command uses safe Snowflake conversions, loads only rows whose
+mapped values convert successfully, and writes invalid columns with their
+original row values to `ETL_DATA_QUALITY_ERRORS`. Raw landing rows remain
+available for correction and reprocessing.
+
 Load multiple mapped tables in one run (one Snowflake and 4D connection, with a
 single run ID in the audit log):
 
