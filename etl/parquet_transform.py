@@ -400,7 +400,14 @@ def transform_parquet_raw_to_target(
             raise RuntimeError(
                 f"Parquet file {file_value} has not completed its Snowflake raw load"
             )
-        if str(ledger_row[2] or "").upper() == "SUCCESS":
+        previously_succeeded_with_zero_rows = (
+            int(ledger_row[1] or 0) > 0
+            and int(ledger_row[3] or 0) == 0
+        )
+        if (
+            str(ledger_row[2] or "").upper() == "SUCCESS"
+            and not previously_succeeded_with_zero_rows
+        ):
             return ParquetTransformResult(
                 run_id=run_value,
                 target_table=target_table,
@@ -544,6 +551,32 @@ def transform_parquet_raw_to_target(
                      LATERAL FLATTEN(INPUT => {error_array}) f
                 """,
                 (run_value, target_table, source_table),
+            )
+
+        if source_rows_count > 0 and inserted_rows == 0:
+            error_groups = cursor.execute(
+                f"""
+                SELECT ERROR_COLUMN, ERROR_TYPE, COUNT(*), LEFT(MIN(ERROR_MESSAGE), 500)
+                FROM {quarantine_table}
+                WHERE RUN_ID = %s AND TARGET_TABLE = %s
+                GROUP BY ERROR_COLUMN, ERROR_TYPE
+                ORDER BY COUNT(*) DESC, ERROR_COLUMN
+                LIMIT 10
+                """,
+                (run_value, target_table),
+            ).fetchall()
+            error_summary = "; ".join(
+                f"{column or '<unknown column>'} [{error_type}]: {count}"
+                + (f" (example: {message})" if message else "")
+                for column, error_type, count, message in error_groups
+            )
+            snowflake_connection.commit()
+            transaction_started = False
+            raise RuntimeError(
+                f"No rows were transformed for {target_table}: "
+                f"all {source_rows_count} source rows were rejected. "
+                f"Top data-quality errors: {error_summary or 'no conversion errors were recorded'}. "
+                "Quarantined rows were retained; the target table was not replaced."
             )
 
         typed_select_values = [

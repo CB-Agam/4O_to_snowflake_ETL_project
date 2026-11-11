@@ -165,6 +165,56 @@ class ParquetTransformTests(unittest.TestCase):
 
     @patch("etl.parquet_transform.release_table_run_lock")
     @patch("etl.parquet_transform.acquire_table_run_lock", return_value={"owner": "lock"})
+    def test_stops_before_publishing_when_all_rows_are_rejected(
+        self, _acquire_lock, _release_lock
+    ):
+        cursor = Mock()
+        cursor.execute.return_value = cursor
+        cursor.fetchone.side_effect = [
+            ("SUCCESS", 3352, "SUCCESS", 0, 3352),
+            (3352,),
+            (0,),
+        ]
+        cursor.fetchall.return_value = [
+            (
+                "CREATED_ON",
+                "INVALID_TIMESTAMP",
+                3352,
+                "Invalid value for CREATED_ON (TIMESTAMP_NTZ): 00/00/0 00:00:00",
+            )
+        ]
+        connection = Mock()
+        connection.cursor.return_value = cursor
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"all 3352 source rows were rejected.*CREATED_ON \[INVALID_TIMESTAMP\]: 3352"
+            r".*00/00/0 00:00:00.*target table was not replaced",
+        ):
+            transform_parquet_raw_to_target(
+                connection,
+                "DW_TEST",
+                "RAW",
+                MAPPING,
+                "run-123",
+                "forms.parquet",
+            )
+
+        sql = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertTrue(any("INSERT INTO" in statement and "ETL_DATA_QUALITY_ERRORS" in statement for statement in sql))
+        self.assertTrue(any("GROUP BY ERROR_COLUMN, ERROR_TYPE" in statement for statement in sql))
+        self.assertTrue(any("TRANSFORM_STATUS = 'FAILED'" in statement for statement in sql))
+        self.assertFalse(any("SWAP WITH" in statement for statement in sql))
+        self.assertFalse(
+            any(
+                statement.startswith('INSERT INTO "DW_TEST"."RAW"."ETL_PARQUET_PUBLISH_')
+                for statement in sql
+            )
+        )
+        connection.commit.assert_called()
+
+    @patch("etl.parquet_transform.release_table_run_lock")
+    @patch("etl.parquet_transform.acquire_table_run_lock", return_value={"owner": "lock"})
     def test_skips_file_already_transformed_successfully(
         self, _acquire_lock, release_lock
     ):

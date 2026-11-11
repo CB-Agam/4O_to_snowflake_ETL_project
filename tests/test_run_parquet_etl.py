@@ -146,30 +146,39 @@ class RunParquetEtlTests(unittest.TestCase):
             audit_class.return_value = audit
             first_mapping = _mapping("FIRST_TABLE")
             second_mapping = _mapping("SECOND_TABLE")
+            third_mapping = _mapping("THIRD_TABLE")
             load_mappings.return_value = [
                 ("First Table", "First Table", first_mapping),
                 ("Second Table", "Second Table", second_mapping),
+                ("Third Table", "Third Table", third_mapping),
             ]
             export.side_effect = [
                 RuntimeError("4D extraction failed"),
                 _export_result("SECOND_TABLE"),
+                _export_result("THIRD_TABLE"),
             ]
             load_raw.return_value = SimpleNamespace(
                 loaded_rows=10,
                 skipped_as_duplicate=False,
                 raw_table='"DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST"',
             )
-            transform.return_value = SimpleNamespace(
-                inserted_rows=10,
-                rejected_rows=0,
-                skipped_as_duplicate=False,
-            )
+            transform.side_effect = [
+                RuntimeError(
+                    "No rows were transformed: all source rows were rejected"
+                ),
+                SimpleNamespace(
+                    inserted_rows=10,
+                    rejected_rows=0,
+                    skipped_as_duplicate=False,
+                ),
+            ]
 
             result = run_parquet_etl.main(
                 [
                     "--tables",
                     "First Table",
                     "Second Table",
+                    "Third Table",
                     "--database",
                     "DW_TEST",
                     "--schema",
@@ -178,10 +187,11 @@ class RunParquetEtlTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 1)
-        self.assertEqual(export.call_count, 2)
-        self.assertEqual(load_raw.call_count, 1)
-        self.assertEqual(transform.call_count, 1)
-        self.assertEqual(transform.call_args.args[3], second_mapping)
+        self.assertEqual(export.call_count, 3)
+        self.assertEqual(load_raw.call_count, 2)
+        self.assertEqual(transform.call_count, 2)
+        self.assertEqual(transform.call_args_list[0].args[3], second_mapping)
+        self.assertEqual(transform.call_args_list[1].args[3], third_mapping)
         pipeline_finish = audit.finish_step.call_args_list[-1]
         self.assertEqual(pipeline_finish.args[1], "PARTIAL")
 

@@ -92,6 +92,10 @@ transform, row counts, file details, and errors are recorded in
 `ETL_PARQUET_FILE_LOADS`. Temporary staging is recreated when a Parquet file
 is replayed, because the ledger records load history but the temporary rows do
 not survive the Snowflake session.
+If a nonempty table has zero valid rows, the transform fails with counts and
+sample messages grouped by invalid column and error type. It keeps the rejected
+rows in `ETL_DATA_QUALITY_ERRORS`, does not publish an empty target snapshot,
+and allows the runner to continue with the next selected table.
 
 The runner uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` from `.env`; pass
 `--database` and `--schema` to override them. The mapping worksheet is inferred
