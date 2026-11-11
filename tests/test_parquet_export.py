@@ -97,7 +97,7 @@ class ParquetExportTests(unittest.TestCase):
                 [
                     {
                         "MSG_NO": "1",
-                        "MSGDATE": "00/00/0 00:00:00",
+                        "MSGDATE": None,
                         "AMOUNT": "308905.57999999996",
                     },
                     {
@@ -128,7 +128,7 @@ class ParquetExportTests(unittest.TestCase):
         )
         self.assertEqual(
             _normalize_timestamp_text("00/00/0 00:00:00", "CREATED_ON"),
-            "00/00/0 00:00:00",
+            None,
         )
 
     def test_rejects_source_count_mismatch_and_removes_partial_file(self):
