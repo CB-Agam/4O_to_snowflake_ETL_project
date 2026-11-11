@@ -106,9 +106,37 @@ class ParquetTransformTests(unittest.TestCase):
         self.assertFalse(result.skipped_as_duplicate)
         sql = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertTrue(any("CREATE TEMPORARY TABLE" in statement for statement in sql))
+        validation_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if call.args[0].startswith("CREATE TEMPORARY TABLE")
+            and "ETL_PARQUET_VALIDATE_" in call.args[0]
+        )
+        self.assertIn("%s", validation_call.args[0])
+        self.assertEqual(validation_call.args[1], ("run-123", "forms.parquet"))
+        self.assertTrue(
+            any(
+                statement.startswith(
+                    'SELECT COUNT(*) FROM "DW_TEST"."RAW"."USER_DEFINED_FORM_BUILDS_RAW" r WHERE r."ETL_RUN_ID"'
+                )
+                for statement in sql
+            )
+        )
         self.assertTrue(any("TRY_TO_TIMESTAMP_NTZ" in statement for statement in sql))
         self.assertTrue(any("ARRAY_CONSTRUCT_COMPACT" in statement for statement in sql))
         self.assertTrue(any("ETL_DATA_QUALITY_ERRORS" in statement for statement in sql))
+        quarantine_insert = next(
+            statement
+            for statement in sql
+            if statement.strip().startswith(
+                'INSERT INTO "DW_TEST"."RAW"."ETL_DATA_QUALITY_ERRORS"'
+            )
+        )
+        self.assertIn(
+            "'Invalid value for CREATED_ON (TIMESTAMP_NTZ): ' || COALESCE",
+            quarantine_insert,
+        )
+        self.assertNotIn("' ('TIMESTAMP_NTZ')", quarantine_insert)
         self.assertTrue(
             any(
                 statement.startswith(

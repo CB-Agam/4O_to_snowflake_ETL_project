@@ -107,10 +107,21 @@ class ParquetSnowflakeTests(unittest.TestCase):
             sql = [call.args[0] for call in cursor.execute.call_args_list]
             self.assertTrue(any('"MSG_NO" VARCHAR' in item for item in sql))
             self.assertTrue(any("FILE_FORMAT=(TYPE=PARQUET)" in item for item in sql))
-            self.assertTrue(any(item.startswith("PUT ") for item in sql))
-            self.assertTrue(any(item.startswith("COPY INTO ") for item in sql))
+            put_sql = next(item for item in sql if item.startswith("PUT "))
+            copy_sql = next(item for item in sql if item.startswith("COPY INTO "))
+            self.assertIn(" @", put_sql)
+            self.assertIn("/ AUTO_COMPRESS=FALSE", put_sql)
+            self.assertIn(" FROM @", copy_sql)
+            self.assertIn("/ FILES = ('messages.parquet')", copy_sql)
             self.assertTrue(any("ETL_PARQUET_FILE_LOADS" in item for item in sql))
             self.assertTrue(any("STATUS = 'SUCCESS'" in item for item in sql))
+            ledger_insert = next(
+                call
+                for call in cursor.execute.call_args_list
+                if "INSERT INTO" in call.args[0]
+                and "ETL_PARQUET_FILE_LOADS" in call.args[0]
+            )
+            self.assertEqual(ledger_insert.args[1][2], "messages.parquet")
             self.assertEqual(connection.commit.call_count, 2)
             cursor.close.assert_called_once()
             acquire_lock.assert_called_once()

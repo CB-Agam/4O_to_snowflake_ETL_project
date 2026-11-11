@@ -230,7 +230,7 @@ def _start_file_ledger(
             """,
             (
                 run_id,
-                str(file_path),
+                file_path.name,
                 size_bytes,
                 parquet_rows,
                 target_table,
@@ -248,7 +248,7 @@ def _start_file_ledger(
             (
                 run_id,
                 target_table,
-                str(file_path),
+                file_path.name,
                 digest,
                 size_bytes,
                 parquet_rows,
@@ -361,7 +361,7 @@ def load_parquet_to_raw_table(
 
         stage_directory = f"{run_component}/{target_component}/{digest[:16]}"
         stage_file_name = file_path.name.replace("'", "''")
-        stage_location = f"@{stage}/{stage_directory}"
+        stage_location = f"@{stage}/{stage_directory}/"
         source_uri = _local_file_uri(file_path).replace("'", "''")
         cursor.execute(
             f"PUT '{source_uri}' {stage_location} "

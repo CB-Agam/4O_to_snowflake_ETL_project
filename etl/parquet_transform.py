@@ -411,7 +411,7 @@ def transform_parquet_raw_to_target(
 
         quarantine_table = ensure_quarantine_table(cursor, database, schema)
         raw_count = cursor.execute(
-            f"SELECT COUNT(*) FROM {raw_table} WHERE {raw_filter}",
+            f"SELECT COUNT(*) FROM {raw_table} r WHERE {raw_filter}",
             (run_value, file_value),
         ).fetchone()
         source_rows_count = int(raw_count[0]) if raw_count else 0
@@ -472,7 +472,8 @@ def transform_parquet_raw_to_target(
             f"CREATE TEMPORARY TABLE {validation_table} AS "
             f"SELECT p.*"
             f"{', ' + ', '.join(validation_values) if validation_values else ''} "
-            f"FROM {parsed_table}"
+            f"FROM {parsed_table}",
+            (run_value, file_value),
         )
 
         invalid_conditions = [
@@ -504,9 +505,8 @@ def transform_parquet_raw_to_target(
                 if invalid_alias is None:
                     continue
                 message = (
-                    f"'Invalid value for ' || {_sql_literal(conversion.column)} || "
-                    f"' ({_sql_literal(conversion.snowflake_type)}): ' || "
-                    f"COALESCE(TO_VARCHAR(r.{_quote_identifier(conversion.column)}), '<NULL>')"
+                    f"{_sql_literal(f'Invalid value for {conversion.column} ({conversion.snowflake_type}): ')} "
+                    f"|| COALESCE(TO_VARCHAR(r.{_quote_identifier(conversion.column)}), '<NULL>')"
                 )
                 error_objects.append(
                     "IFF("
