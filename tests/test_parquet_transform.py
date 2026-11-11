@@ -98,12 +98,17 @@ class ParquetTransformTests(unittest.TestCase):
             MAPPING,
             "run-123",
             "forms.parquet",
+            raw_table_reference='"DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST"',
         )
 
         self.assertEqual(result.source_rows, 2)
         self.assertEqual(result.inserted_rows, 1)
         self.assertEqual(result.rejected_rows, 1)
         self.assertFalse(result.skipped_as_duplicate)
+        self.assertEqual(
+            result.raw_table,
+            '"DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST"',
+        )
         sql = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertTrue(any("CREATE TEMPORARY TABLE" in statement for statement in sql))
         validation_call = next(
@@ -117,7 +122,7 @@ class ParquetTransformTests(unittest.TestCase):
         self.assertTrue(
             any(
                 statement.startswith(
-                    'SELECT COUNT(*) FROM "DW_TEST"."RAW"."USER_DEFINED_FORM_BUILDS_RAW" r WHERE r."ETL_RUN_ID"'
+                    'SELECT COUNT(*) FROM "DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST" r WHERE r."ETL_RUN_ID"'
                 )
                 for statement in sql
             )

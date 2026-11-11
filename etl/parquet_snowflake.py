@@ -129,6 +129,7 @@ def _ensure_raw_target(
     schema: str,
     raw_table: str,
     target_columns: Sequence[str],
+    temporary: bool = False,
 ) -> str:
     target = _qualified_name(database, schema, raw_table)
     definitions = [
@@ -143,9 +144,11 @@ def _ensure_raw_target(
             "DEFAULT CURRENT_TIMESTAMP()",
         ]
     )
-    cursor.execute(
-        f"CREATE TABLE IF NOT EXISTS {target} ({', '.join(definitions)})"
-    )
+    create_kind = "CREATE TEMPORARY TABLE" if temporary else "CREATE TABLE IF NOT EXISTS"
+    cursor.execute(f"{create_kind} {target} ({', '.join(definitions)})")
+    if temporary:
+        return target
+
     cursor.execute(f"DESC TABLE {target}")
     descriptions = cursor.fetchall()
     existing_types = {
@@ -204,6 +207,7 @@ def _start_file_ledger(
     digest: str,
     size_bytes: int,
     parquet_rows: int,
+    skip_successful: bool = True,
 ) -> int | None:
     existing = cursor.execute(
         f"""
@@ -217,7 +221,11 @@ def _start_file_ledger(
         raise RuntimeError(
             f"File ledger has duplicate records for {target_table} and SHA256 {digest}"
         )
-    if existing and str(existing[0][0]).upper() == "SUCCESS":
+    if (
+        existing
+        and str(existing[0][0]).upper() == "SUCCESS"
+        and skip_successful
+    ):
         return int(existing[0][1] or 0)
     if existing:
         cursor.execute(
@@ -284,6 +292,7 @@ def load_parquet_to_raw_table(
     mapping_rows: Sequence[dict[str, str]],
     parquet_path: str | Path,
     run_id: str,
+    persistent_raw: bool = True,
 ) -> ParquetLoadResult:
     file_path = Path(parquet_path).resolve()
     target_table, target_columns = _mapped_target_columns(mapping_rows)
@@ -297,15 +306,26 @@ def load_parquet_to_raw_table(
     )
     file_size = file_path.stat().st_size
     digest = _file_sha256(file_path)
-    raw_table = f"{target_table}_RAW"
-    if len(raw_table) > 255:
-        raise ValueError(f"Raw table name exceeds Snowflake identifier limit: {raw_table}")
+    raw_table_name = (
+        f"{target_table}_RAW"
+        if persistent_raw
+        else f"ETL_PARQUET_RAW_{uuid4().hex[:16].upper()}"
+    )
+    if len(raw_table_name) > 255:
+        raise ValueError(f"Raw table name exceeds Snowflake identifier limit: {raw_table_name}")
+    raw_table = (
+        raw_table_name
+        if persistent_raw
+        else _qualified_name(database, schema, raw_table_name)
+    )
     stage_name = "ETL_PARQUET_STAGE"
     stage = _qualified_name(database, schema, stage_name)
 
     cursor = snowflake_connection.cursor()
     lock: dict[str, str] | None = None
     stage_table: str | None = None
+    raw_target: str | None = None
+    load_succeeded = False
     started_ledger = False
     try:
         ledger = _ensure_file_ledger(cursor, database, schema)
@@ -328,6 +348,7 @@ def load_parquet_to_raw_table(
             digest,
             file_size,
             parquet_rows,
+            skip_successful=persistent_raw,
         )
         if skipped_rows is not None:
             return ParquetLoadResult(
@@ -347,8 +368,9 @@ def load_parquet_to_raw_table(
             cursor,
             database,
             schema,
-            raw_table,
+            raw_table_name,
             target_columns,
+            temporary=not persistent_raw,
         )
         cursor.execute(f"CREATE STAGE IF NOT EXISTS {stage}")
         stage_table_name = f"ETL_PARQUET_LOAD_{uuid4().hex[:16].upper()}"
@@ -464,6 +486,7 @@ def load_parquet_to_raw_table(
             copy_loaded_rows,
             digest,
         )
+        load_succeeded = True
         return ParquetLoadResult(
             run_id=run_component,
             target_table=target_table,
@@ -495,6 +518,11 @@ def load_parquet_to_raw_table(
                 cursor.execute(f"DROP TABLE IF EXISTS {stage_table}")
             except Exception:
                 logger.exception("Could not remove temporary Parquet table for %s", target_table)
+        if raw_target is not None and not persistent_raw and not load_succeeded:
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS {raw_target}")
+            except Exception:
+                logger.exception("Could not remove failed temporary raw table for %s", target_table)
         if lock is not None:
             try:
                 release_table_run_lock(
@@ -505,4 +533,12 @@ def load_parquet_to_raw_table(
                 )
             except Exception:
                 logger.exception("Could not release Parquet load lock for %s", target_table)
+        cursor.close()
+
+
+def drop_temporary_raw_table(snowflake_connection: Any, raw_table: str) -> None:
+    cursor = snowflake_connection.cursor()
+    try:
+        cursor.execute(f"DROP TABLE IF EXISTS {raw_table}")
+    finally:
         cursor.close()

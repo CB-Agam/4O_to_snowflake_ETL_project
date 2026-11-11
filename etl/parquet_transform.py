@@ -309,6 +309,7 @@ def transform_parquet_raw_to_target(
     mapping_rows: Sequence[dict[str, str]],
     run_id: str,
     file_name: str,
+    raw_table_reference: str | None = None,
 ) -> ParquetTransformResult:
     target_table, _ = _mapped_target_columns(mapping_rows)
     source_table = next(
@@ -318,7 +319,9 @@ def transform_parquet_raw_to_target(
         and row.get("target_column", "").strip()
     )
     raw_table_name = f"{target_table}_RAW"
-    raw_table = _qualified_name(database, schema, raw_table_name)
+    raw_table = raw_table_reference or _qualified_name(
+        database, schema, raw_table_name
+    )
     target = _qualified_name(database, schema, target_table)
     ledger = _qualified_name(database, schema, "ETL_PARQUET_FILE_LOADS")
     run_value = str(run_id).strip()
@@ -401,7 +404,7 @@ def transform_parquet_raw_to_target(
             return ParquetTransformResult(
                 run_id=run_value,
                 target_table=target_table,
-                raw_table=raw_table_name,
+                raw_table=raw_table,
                 file_name=file_value,
                 source_rows=int(ledger_row[1] or 0),
                 inserted_rows=int(ledger_row[3] or 0),
@@ -601,7 +604,7 @@ def transform_parquet_raw_to_target(
         return ParquetTransformResult(
             run_id=run_value,
             target_table=target_table,
-            raw_table=raw_table_name,
+            raw_table=raw_table,
             file_name=file_value,
             source_rows=source_rows_count,
             inserted_rows=inserted_rows,

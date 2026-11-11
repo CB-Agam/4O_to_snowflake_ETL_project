@@ -57,7 +57,7 @@ py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 
 ## Single-file Parquet end-to-end ETL
 
-Run the complete export, raw load, and typed transform flow with one command.
+Run the complete export, temporary staging load, and typed transform flow with one command.
 The existing `run_initial_etl.py` command remains unchanged.
 
 ```powershell
@@ -79,14 +79,19 @@ if any table failed:
 ```
 
 The runner uses one 4D connection, one Snowflake connection, and one run ID
-for all selected tables. Each table gets one completed Parquet file, is loaded
-into its `<TARGET_TABLE>_RAW` VARCHAR landing table, and then has valid rows
-published to the mapped target. Raw rows stay available for correction;
-invalid mapped values are recorded in `ETL_DATA_QUALITY_ERRORS`. Existing
-target snapshots are preserved under generated `<TARGET_TABLE>_HIST_<ID>`
-names. Per-table extraction, load, transform, row counts, file details, and
-errors are recorded in `ETL_PIPELINE_LOG`; load and transform details are also
-tracked in `ETL_PARQUET_FILE_LOADS`.
+for all selected tables. Each table gets one completed Parquet file, is copied
+into a session-scoped temporary VARCHAR staging table, and then has valid rows
+published to the mapped target. The temporary table is dropped after the
+transform, so this end-to-end command does not create a permanent
+`<TARGET_TABLE>_RAW` table. Invalid mapped values and their raw row values are
+recorded in `ETL_DATA_QUALITY_ERRORS`; the local Parquet file remains available
+for later correction and reprocessing. Existing target snapshots are preserved
+under generated `<TARGET_TABLE>_HIST_<ID>` names. Per-table extraction, load,
+transform, row counts, file details, and errors are recorded in
+`ETL_PIPELINE_LOG`; load and transform details are also tracked in
+`ETL_PARQUET_FILE_LOADS`. Temporary staging is recreated when a Parquet file
+is replayed, because the ledger records load history but the temporary rows do
+not survive the Snowflake session.
 
 The runner uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` from `.env`; pass
 `--database` and `--schema` to override them. The mapping worksheet is inferred
@@ -96,15 +101,13 @@ pass `--sheet "Worksheet Name"`.
 To run each stage separately (for example, when resuming from an already
 completed export), use the commands below.
 
-The individual commands together export one complete table from 4D to one
-local Parquet file, upload and copy it into a Snowflake raw landing table, and
-transform valid values into the mapped production table.
-The Snowflake command writes to `<TARGET_TABLE>_RAW`, where mapped data fields
-are `VARCHAR` so source values remain available for validation and cleansing.
-The transform command publishes a full snapshot of valid rows and records
-conversion failures in `ETL_DATA_QUALITY_ERRORS`. If a target already exists,
-the previous snapshot is preserved under a generated `<TARGET_TABLE>_HIST_<ID>`
-name.
+The individual commands are a resumable, durable-landing alternative to the
+end-to-end runner above. They write to `<TARGET_TABLE>_RAW`, where mapped data
+fields are `VARCHAR`; use the end-to-end runner when you do not want that
+permanent raw table. The transform command publishes a full snapshot of valid
+rows and records conversion failures in `ETL_DATA_QUALITY_ERRORS`. If a target
+already exists, the previous snapshot is preserved under a generated
+`<TARGET_TABLE>_HIST_<ID>` name.
 
 For `User_Defined_Form_Builds`, run from the repository root in PowerShell:
 
@@ -137,8 +140,13 @@ counts, records the file SHA-256 to prevent reloading the same successful file,
 and keeps raw date/numeric values as text for subsequent validation. The
 transform command uses safe Snowflake conversions, loads only rows whose
 mapped values convert successfully, and writes invalid columns with their
-original row values to `ETL_DATA_QUALITY_ERRORS`. Raw landing rows remain
-available for correction and reprocessing.
+original row values to `ETL_DATA_QUALITY_ERRORS`.
+
+When a mapped Snowflake type is a timestamp, valid source timestamp strings
+are normalized in the Parquet file before upload. Slash-separated ambiguous
+dates are interpreted day-first (for example, `11/06/2013` becomes
+`2013-06-11`); unparseable values are retained unchanged so the transform can
+quarantine them.
 
 Load multiple mapped tables in one run (one Snowflake and 4D connection, with a
 single run ID in the audit log):

@@ -129,6 +129,48 @@ class ParquetSnowflakeTests(unittest.TestCase):
 
     @patch("etl.parquet_snowflake.release_table_run_lock")
     @patch("etl.parquet_snowflake.acquire_table_run_lock", return_value={"owner": "lock"})
+    def test_loads_into_temporary_raw_table_without_creating_target_raw_table(
+        self, _acquire_lock, _release_lock
+    ):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parquet_path = Path(temporary_directory) / "messages.parquet"
+            _write_parquet(parquet_path)
+            cursor = Mock()
+            _mock_cursor_for_success(cursor)
+            cursor.fetchall.side_effect = [
+                [("SUCCESS", 2)],
+                [("UPLOADED", "ok")],
+                [(2, 0)],
+            ]
+            connection = Mock()
+            connection.cursor.return_value = cursor
+
+            result = load_parquet_to_raw_table(
+                connection,
+                "DW_TEST",
+                "RAW",
+                MAPPING,
+                parquet_path,
+                "run-001",
+                persistent_raw=False,
+            )
+
+            self.assertTrue(result.raw_table.startswith('"DW_TEST"."RAW"."ETL_PARQUET_RAW_'))
+            self.assertFalse(result.skipped_as_duplicate)
+            sql = [call.args[0] for call in cursor.execute.call_args_list]
+            self.assertTrue(
+                any(statement.startswith("CREATE TEMPORARY TABLE") and "ETL_PARQUET_RAW_" in statement for statement in sql)
+            )
+            self.assertFalse(
+                any("CREATE TABLE IF NOT EXISTS" in statement and "MESSAGES_RAW" in statement for statement in sql)
+            )
+            self.assertTrue(
+                any(statement.startswith("INSERT INTO") and result.raw_table in statement for statement in sql)
+            )
+            self.assertTrue(any("STATUS = 'RUNNING'" in statement for statement in sql))
+
+    @patch("etl.parquet_snowflake.release_table_run_lock")
+    @patch("etl.parquet_snowflake.acquire_table_run_lock", return_value={"owner": "lock"})
     def test_skips_file_hash_already_marked_successful(
         self, _acquire_lock, release_lock
     ):

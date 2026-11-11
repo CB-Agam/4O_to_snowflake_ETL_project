@@ -8,7 +8,10 @@ from unittest.mock import Mock
 
 import pyarrow.parquet as pq
 
-from etl.parquet_export import export_table_to_parquet
+from etl.parquet_export import (
+    _normalize_timestamp_text,
+    export_table_to_parquet,
+)
 
 
 def _messages_mapping():
@@ -26,6 +29,7 @@ def _messages_mapping():
             "source_data_type": "TIMESTAMP",
             "target_table": "MESSAGES",
             "target_column": "MSGDATE",
+            "snowflake_datatype": "TIMESTAMP_NTZ",
         },
         {
             "source_table": "Messages",
@@ -98,16 +102,34 @@ class ParquetExportTests(unittest.TestCase):
                     },
                     {
                         "MSG_NO": "2",
-                        "MSGDATE": "2007-05-28T00:00:00",
+                        "MSGDATE": "2007-05-28 00:00:00",
                         "AMOUNT": None,
                     },
                     {
                         "MSG_NO": "3",
-                        "MSGDATE": "2023/08/25 15:03:00.000",
+                        "MSGDATE": "2023-08-25 15:03:00",
                         "AMOUNT": "1.2500",
                     },
                 ],
             )
+
+    def test_normalizes_timestamp_strings_and_preserves_invalid_values(self):
+        self.assertEqual(
+            _normalize_timestamp_text("11/06/2013 00:00:00", "MODIFIED_ON"),
+            "2013-06-11 00:00:00",
+        )
+        self.assertEqual(
+            _normalize_timestamp_text("20/03/2006 12:30:45", "CREATED_ON"),
+            "2006-03-20 12:30:45",
+        )
+        self.assertEqual(
+            _normalize_timestamp_text("11/23/2013 00:00:00", "MODIFIED_ON"),
+            "2013-11-23 00:00:00",
+        )
+        self.assertEqual(
+            _normalize_timestamp_text("00/00/0 00:00:00", "CREATED_ON"),
+            "00/00/0 00:00:00",
+        )
 
     def test_rejects_source_count_mismatch_and_removes_partial_file(self):
         count_before = Mock()

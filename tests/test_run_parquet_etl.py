@@ -45,6 +45,7 @@ class RunParquetEtlTests(unittest.TestCase):
             patch("scripts.run_parquet_etl._load_selected_mappings") as load_mappings,
             patch("scripts.run_parquet_etl.export_table_to_parquet") as export,
             patch("scripts.run_parquet_etl.load_parquet_to_raw_table") as load_raw,
+            patch("scripts.run_parquet_etl.drop_temporary_raw_table") as drop_raw,
             patch("scripts.run_parquet_etl.transform_parquet_raw_to_target") as transform,
         ):
             snowflake_connection = Mock()
@@ -63,6 +64,7 @@ class RunParquetEtlTests(unittest.TestCase):
             load_raw.return_value = SimpleNamespace(
                 loaded_rows=10,
                 skipped_as_duplicate=False,
+                raw_table='"DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST"',
             )
             transform.return_value = SimpleNamespace(
                 inserted_rows=9,
@@ -101,6 +103,7 @@ class RunParquetEtlTests(unittest.TestCase):
             mapping_rows,
             _export_result("CUSTOMERS").file_path,
             "run-123",
+            persistent_raw=False,
         )
         transform.assert_called_once_with(
             snowflake_connection,
@@ -109,6 +112,11 @@ class RunParquetEtlTests(unittest.TestCase):
             mapping_rows,
             "run-123",
             "customers.parquet",
+            raw_table_reference='"DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST"',
+        )
+        drop_raw.assert_called_once_with(
+            snowflake_connection,
+            '"DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST"',
         )
         self.assertEqual(audit.record.call_count, 5)
         close_4d.assert_called_once_with(source_connection)
@@ -125,6 +133,7 @@ class RunParquetEtlTests(unittest.TestCase):
             patch("scripts.run_parquet_etl._load_selected_mappings") as load_mappings,
             patch("scripts.run_parquet_etl.export_table_to_parquet") as export,
             patch("scripts.run_parquet_etl.load_parquet_to_raw_table") as load_raw,
+            patch("scripts.run_parquet_etl.drop_temporary_raw_table"),
             patch("scripts.run_parquet_etl.transform_parquet_raw_to_target") as transform,
         ):
             snowflake_connection = Mock()
@@ -148,6 +157,7 @@ class RunParquetEtlTests(unittest.TestCase):
             load_raw.return_value = SimpleNamespace(
                 loaded_rows=10,
                 skipped_as_duplicate=False,
+                raw_table='"DW_TEST"."RAW"."ETL_PARQUET_RAW_TEST"',
             )
             transform.return_value = SimpleNamespace(
                 inserted_rows=10,

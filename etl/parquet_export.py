@@ -70,6 +70,73 @@ def _raw_value_as_text(value: Any) -> str | None:
     return str(value)
 
 
+def _normalize_timestamp_text(value: str, column_name: str) -> str:
+    value = value.strip()
+    if not value:
+        return value
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is None:
+        slash_date = re.fullmatch(
+            r"(\d{1,2})/(\d{1,2})/(\d{4})(?:[ T](\d{1,2}:\d{2}:\d{2}(?:\.\d{1,6})?))?",
+            value,
+        )
+        if slash_date:
+            first, second = int(slash_date.group(1)), int(slash_date.group(2))
+            if first > 12 and second <= 12:
+                date_format = "%d/%m/%Y"
+            elif second > 12 and first <= 12:
+                date_format = "%m/%d/%Y"
+            else:
+                date_format = "%d/%m/%Y"
+            time_value = slash_date.group(4)
+            format_string = date_format
+            if time_value:
+                format_string += " %H:%M:%S"
+                if "." in time_value:
+                    format_string += ".%f"
+            try:
+                parsed = datetime.strptime(value, format_string)
+            except ValueError:
+                parsed = None
+
+    if parsed is None:
+        for format_string in (
+            "%Y/%m/%d %H:%M:%S.%f",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d",
+            "%Y-%m-%d",
+        ):
+            try:
+                parsed = datetime.strptime(value, format_string)
+                break
+            except ValueError:
+                continue
+
+    if parsed is None:
+        logger.debug(
+            "Preserving unparsed source timestamp for %s: %r",
+            column_name,
+            value,
+        )
+        return value
+    return parsed.isoformat(sep=" ")
+
+
+def _mapped_value_as_text(value: Any, snowflake_type: str, column_name: str) -> str | None:
+    text = _raw_value_as_text(value)
+    if text is None:
+        return None
+    normalized_type = re.sub(r"/\*.*?\*/", "", snowflake_type, flags=re.DOTALL)
+    if normalized_type.strip().upper().startswith("TIMESTAMP"):
+        return _normalize_timestamp_text(text, column_name)
+    return text
+
+
 def _mapping_for_export(
     mapping_rows: Sequence[dict[str, str]],
 ) -> tuple[str, str, list[str], list[str], list[dict[str, str]]]:
@@ -142,6 +209,10 @@ def export_table_to_parquet(
         (source_indexes[row["source_column"].strip()], target_index)
         for target_index, row in enumerate(source_rows)
     ]
+    snowflake_types = [
+        row.get("snowflake_datatype", "") or "VARCHAR"
+        for row in source_rows
+    ]
     schema = pa.schema(
         [pa.field(column, pa.string(), nullable=True) for column in target_columns],
         metadata={
@@ -167,7 +238,13 @@ def export_table_to_parquet(
                     f"expected {len(source_columns)}"
                 )
             for source_index, target_index in row_mapping:
-                column_values[target_index].append(_raw_value_as_text(row[source_index]))
+                column_values[target_index].append(
+                    _mapped_value_as_text(
+                        row[source_index],
+                        snowflake_types[target_index],
+                        target_columns[target_index],
+                    )
+                )
         arrays = [
             pa.array(values, type=pa.string())
             for values in column_values

@@ -24,7 +24,10 @@ from connections.snowflake_connection import (
 from etl.audit import SnowflakeAuditLogger
 from etl.metadata import load_metadata_from_excel
 from etl.parquet_export import export_table_to_parquet
-from etl.parquet_snowflake import load_parquet_to_raw_table
+from etl.parquet_snowflake import (
+    drop_temporary_raw_table,
+    load_parquet_to_raw_table,
+)
 from etl.parquet_transform import transform_parquet_raw_to_target
 
 DEFAULT_EXCEL_PATH = PROJECT_ROOT / "4D_to_Snowflake (1-50 tables mapping).xlsx"
@@ -66,7 +69,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=(
             "Run a complete 4D-to-Snowflake Parquet ETL for one or more mapped "
             "tables. Each table is extracted to one Parquet file, loaded into "
-            "a VARCHAR raw table, then transformed with invalid values quarantined."
+            "temporary staging, then transformed with invalid values quarantined."
         )
     )
     selection = parser.add_mutually_exclusive_group(required=True)
@@ -200,6 +203,7 @@ def _run_table(
         "rejected_rows": None,
     }
 
+    temporary_raw_table: str | None = None
     try:
         extraction = export_table_to_parquet(
             source_connection,
@@ -242,7 +246,10 @@ def _run_table(
             mapping_rows,
             extraction.file_path,
             extraction.run_id,
+            persistent_raw=False,
         )
+        if not raw_load.skipped_as_duplicate:
+            temporary_raw_table = raw_load.raw_table
         details.update(
             snowflake_load_status="SUCCESS",
             loaded_rows=raw_load.loaded_rows,
@@ -271,6 +278,7 @@ def _run_table(
             mapping_rows,
             extraction.run_id,
             extraction.file_path.name,
+            raw_table_reference=raw_load.raw_table,
         )
         details.update(
             transform_status="SUCCESS",
@@ -347,6 +355,18 @@ def _run_table(
             logger.exception("Could not write failure audit for %s", target_table)
         logger.exception("Parquet ETL failed for %s", target_table)
         return details
+    finally:
+        if temporary_raw_table is not None:
+            try:
+                drop_temporary_raw_table(
+                    snowflake_connection,
+                    temporary_raw_table,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not remove temporary raw staging table %s",
+                    temporary_raw_table,
+                )
 
 
 def main(argv: list[str] | None = None) -> int:
