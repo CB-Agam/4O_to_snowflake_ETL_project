@@ -21,6 +21,11 @@ def _is_temporal_source_type(source_data_type: str) -> bool:
     return any(token in normalized for token in ("DATE", "TIME", "TIMESTAMP", "INTERVAL"))
 
 
+def _is_undefined_source_type(source_data_type: str) -> bool:
+    normalized = source_data_type.strip().upper().strip("() ")
+    return not normalized or normalized in {"UNDEFINED", "UNKNOWN"}
+
+
 def build_full_table_query(mapping_rows: Sequence[dict[str, str]]) -> str:
     source_rows = [
         row
@@ -41,7 +46,10 @@ def build_full_table_query(mapping_rows: Sequence[dict[str, str]]) -> str:
         dict.fromkeys(
             row["source_column"].strip()
             for row in source_rows
-            if _is_temporal_source_type(row.get("source_data_type", ""))
+            if (
+                _is_temporal_source_type(row.get("source_data_type", ""))
+                or _is_undefined_source_type(row.get("source_data_type", ""))
+            )
         )
     )
     return build_source_query(

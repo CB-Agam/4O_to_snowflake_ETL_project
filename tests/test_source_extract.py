@@ -41,6 +41,30 @@ class SourceExtractionTests(unittest.TestCase):
             "CAST([MsgTime] AS VARCHAR) FROM [Messages]",
         )
 
+    def test_build_full_table_query_casts_undefined_source_types_to_text(self):
+        query = build_full_table_query(
+            [
+                {
+                    "source_table": "User_Defined_Form_Builds",
+                    "source_column": "Form ID",
+                    "source_data_type": "INT32",
+                    "target_column": "FORM_ID",
+                },
+                {
+                    "source_table": "User_Defined_Form_Builds",
+                    "source_column": "OBJ_WP_HeaderPage",
+                    "source_data_type": "(undefined)",
+                    "target_column": "IS_CONVERTED_TO_WRITE_PRO",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            query,
+            "SELECT [Form ID], CAST([OBJ_WP_HeaderPage] AS VARCHAR) "
+            "FROM [User_Defined_Form_Builds]",
+        )
+
     def test_build_full_table_query_rejects_multiple_source_tables(self):
         mappings = [
             {
