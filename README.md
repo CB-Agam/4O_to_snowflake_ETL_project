@@ -96,6 +96,11 @@ If a nonempty table has zero valid rows, the transform fails with counts and
 sample messages grouped by invalid column and error type. It keeps the rejected
 rows in `ETL_DATA_QUALITY_ERRORS`, does not publish an empty target snapshot,
 and allows the runner to continue with the next selected table.
+For mapped Snowflake `TIME` columns, an all-zero 4D interval such as
+`0:0:0:0:0` is normalized to `NULL` in the Parquet file before upload. This
+avoids rejecting every row on a zero-duration placeholder while keeping the
+mapped Snowflake column as `TIME`. Other nonzero interval strings are retained
+and still require a mapping/conversion decision if they are not valid times.
 
 The runner uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` from `.env`; pass
 `--database` and `--schema` to override them. The mapping worksheet is inferred

@@ -139,8 +139,18 @@ def _mapped_value_as_text(value: Any, snowflake_type: str, column_name: str) -> 
     if text is None:
         return None
     normalized_type = re.sub(r"/\*.*?\*/", "", snowflake_type, flags=re.DOTALL)
-    if normalized_type.strip().upper().startswith("TIMESTAMP"):
+    normalized_type = normalized_type.strip().upper()
+    if normalized_type.startswith("TIMESTAMP"):
         return _normalize_timestamp_text(text, column_name)
+    if normalized_type.startswith("TIME") and re.fullmatch(
+        r"0+(?::0+){4}", text.strip()
+    ):
+        logger.debug(
+            "Replacing zero interval with NULL for %s: %r",
+            column_name,
+            text,
+        )
+        return None
     return text
 
 

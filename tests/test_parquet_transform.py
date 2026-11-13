@@ -52,6 +52,18 @@ class ParquetTransformTests(unittest.TestCase):
         )
         self.assertEqual(_normalize_type("VARCHAR(250)", "CLOB"), "VARCHAR")
 
+    def test_keeps_mapped_interval_column_as_time(self):
+        conversion = _conversion_for_column(
+            "CREATED_AT",
+            "TIME(0)",
+            "INTERVAL",
+        )
+
+        self.assertEqual(conversion.snowflake_type, "TIME(0)")
+        self.assertIn("TRY_TO_TIME", conversion.expression)
+        self.assertIn("IS NULL", conversion.invalid_condition)
+        self.assertEqual(_normalize_type("TIME(0)", "INTERVAL"), "TIME(0)")
+
     def test_timestamp_conversion_tries_day_first_and_iso_formats(self):
         conversion = _conversion_for_column("CREATED_ON", "TIMESTAMP_NTZ")
 

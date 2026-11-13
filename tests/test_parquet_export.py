@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pyarrow.parquet as pq
 
 from etl.parquet_export import (
+    _mapped_value_as_text,
     _normalize_timestamp_text,
     export_table_to_parquet,
 )
@@ -129,6 +130,22 @@ class ParquetExportTests(unittest.TestCase):
         self.assertEqual(
             _normalize_timestamp_text("00/00/0 00:00:00", "CREATED_ON"),
             None,
+        )
+
+    def test_converts_zero_interval_to_null_for_time_columns(self):
+        self.assertIsNone(
+            _mapped_value_as_text("0:0:0:0:0", "TIME(0)", "CREATED_AT")
+        )
+        self.assertIsNone(
+            _mapped_value_as_text(" 00:00:00:00:00 ", "TIME", "MODIFIED_AT")
+        )
+        self.assertEqual(
+            _mapped_value_as_text("0:0:27:0:0", "TIME(0)", "CREATED_AT"),
+            "0:0:27:0:0",
+        )
+        self.assertEqual(
+            _mapped_value_as_text("0:0:0:0:0", "VARCHAR", "INTERVAL_TEXT"),
+            "0:0:0:0:0",
         )
 
     def test_rejects_source_count_mismatch_and_removes_partial_file(self):

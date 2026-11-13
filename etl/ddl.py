@@ -18,8 +18,9 @@ def is_primary_key(value: str | None) -> bool:
 
 def _snowflake_column_type(row: Dict[str, str]) -> str:
     data_type = row.get("snowflake_datatype") or "VARCHAR"
+    source_data_type = row.get("source_data_type", "").strip()
     if (
-        row.get("source_data_type", "").strip().upper() == "CLOB"
+        source_data_type.upper() == "CLOB"
         and _BOUNDED_VARCHAR.fullmatch(data_type.strip())
     ):
         return "VARCHAR"

@@ -957,6 +957,25 @@ class EtlCoreTests(unittest.TestCase):
         self.assertIn("CHEQUE_ID_NO NUMBER(18,0) PRIMARY KEY", ddl)
         self.assertIn("AMOUNT NUMBER(18,2)", ddl)
 
+    def test_interval_mapped_as_time_keeps_time_target_type(self):
+        ddl = build_create_table_sql(
+            "TRANSACTION",
+            [
+                {
+                    "source_table": "Transaction",
+                    "source_column": "Created At",
+                    "source_data_type": "INTERVAL",
+                    "target_table": "TRANSACTION",
+                    "target_column": "CREATED_AT",
+                    "snowflake_datatype": "TIME(0)",
+                    "constraint": "",
+                }
+            ],
+            schema_name="UW_RAW_STG",
+        )
+
+        self.assertIn("CREATED_AT TIME(0)", ddl)
+
 
 if __name__ == "__main__":
     unittest.main()
