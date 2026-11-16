@@ -6,10 +6,16 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TypeVar
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def ist_now() -> datetime:
+    return datetime.now(_IST).replace(tzinfo=None)
 
 
 def _quote_snowflake_identifier(identifier: str) -> str:
@@ -79,13 +85,15 @@ class SnowflakeAuditLogger:
     ) -> int:
         self._step_number += 1
         step_number = self._step_number
+        started_at = start_time or ist_now()
+        if started_at.tzinfo is not None:
+            started_at = started_at.astimezone(_IST).replace(tzinfo=None)
+        ended_at = None if status == "RUNNING" else ist_now()
         sql = f"""
             INSERT INTO {self.qualified_table}
                 (RUN_ID, RUN_STEP_NO, TABLE_NAME, STEP, STATUS, MESSAGE,
                  ERROR_MESSAGE, START_TIME, END_TIME)
-            VALUES (%s, %s, %s, %s, %s, %s, %s,
-                    COALESCE(%s, CURRENT_TIMESTAMP()),
-                    CASE WHEN %s = 'RUNNING' THEN NULL ELSE CURRENT_TIMESTAMP() END)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor = self.connection.cursor()
         try:
@@ -99,8 +107,8 @@ class SnowflakeAuditLogger:
                     status,
                     message,
                     error_message,
-                    start_time,
-                    status,
+                    started_at,
+                    ended_at,
                 ),
             )
         finally:
@@ -119,14 +127,14 @@ class SnowflakeAuditLogger:
             SET STATUS = %s,
                 MESSAGE = %s,
                 ERROR_MESSAGE = %s,
-                END_TIME = CURRENT_TIMESTAMP()
+                END_TIME = %s
             WHERE RUN_ID = %s AND RUN_STEP_NO = %s
         """
         cursor = self.connection.cursor()
         try:
             cursor.execute(
                 sql,
-                (status, message, error_message, self.run_id, step_number),
+                (status, message, error_message, ist_now(), self.run_id, step_number),
             )
         finally:
             cursor.close()

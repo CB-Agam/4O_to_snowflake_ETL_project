@@ -4,9 +4,10 @@ import argparse
 import json
 import logging
 import sys
+import tracemalloc
 import traceback
-from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
 
@@ -21,7 +22,8 @@ from connections.snowflake_connection import (
     close_snowflake_connection,
     connect_to_snowflake,
 )
-from etl.audit import SnowflakeAuditLogger
+from etl.audit import SnowflakeAuditLogger, ist_now
+from etl.csv_export import export_table_to_csv
 from etl.metadata import load_metadata_from_excel
 from etl.parquet_export import export_table_to_parquet
 from etl.parquet_snowflake import (
@@ -94,6 +96,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=50_000,
         help="Rows per streaming 4D fetch (default: 50000)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("parquet", "csv"),
+        default="parquet",
+        help="Local extraction file format (default: parquet)",
+    )
+    parser.add_argument(
+        "--measure-memory",
+        action="store_true",
+        help="Record peak Python heap allocation for each table run (excludes native ODBC/PyArrow memory)",
     )
     parser.add_argument(
         "--export-dir",
@@ -170,7 +183,11 @@ def _run_table(
     requested_table: str,
     sheet_name: str,
     mapping_rows: list[dict[str, str]],
+    output_format: str = "parquet",
+    measure_memory: bool = False,
 ) -> dict[str, object]:
+    if output_format not in {"parquet", "csv"}:
+        raise ValueError(f"Unsupported export format: {output_format!r}")
     target_table = next(
         row["target_table"].strip()
         for row in mapping_rows
@@ -179,13 +196,15 @@ def _run_table(
         and row.get("target_table", "").strip()
         and row.get("target_column", "").strip()
     )
-    started_at = datetime.now()
+    started_at = ist_now()
+    run_started = perf_counter()
     active_stage = "EXTRACTION"
     table_step = audit.record(
         "PARQUET_TABLE_RUN",
         "RUNNING",
         target_table,
-        f"Starting 4D-to-Snowflake Parquet flow from worksheet {sheet_name!r}",
+        f"Starting 4D-to-Snowflake {output_format.upper()} flow "
+        f"from worksheet {sheet_name!r}",
         start_time=started_at,
     )
     details: dict[str, object] = {
@@ -197,15 +216,35 @@ def _run_table(
         "snowflake_load_status": "NOT_STARTED",
         "transform_status": "NOT_STARTED",
         "total_extracted_rows": None,
-        "parquet_file_name": None,
-        "parquet_file_size_bytes": None,
+        "export_file_name": None,
+        "export_file_size_bytes": None,
         "loaded_rows": None,
         "rejected_rows": None,
     }
 
     temporary_raw_table: str | None = None
+    tracing_started = False
+    if measure_memory:
+        if tracemalloc.is_tracing():
+            raise RuntimeError(
+                "Cannot measure per-table Python memory while tracemalloc is already active"
+            )
+        tracemalloc.start()
+        tracing_started = True
+
+    def finish_memory_measurement() -> None:
+        nonlocal tracing_started
+        if tracing_started:
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            details["peak_python_memory_bytes"] = peak_bytes
+            tracemalloc.stop()
+            tracing_started = False
+
     try:
-        extraction = export_table_to_parquet(
+        export_function = (
+            export_table_to_csv if output_format == "csv" else export_table_to_parquet
+        )
+        extraction = export_function(
             source_connection,
             mapping_rows,
             export_dir,
@@ -215,11 +254,28 @@ def _run_table(
         details.update(
             extraction_status="SUCCESS",
             total_extracted_rows=extraction.row_count,
-            parquet_file_name=extraction.file_path.name,
-            parquet_file_size_bytes=extraction.file_size_bytes,
-            parquet_file_path=str(extraction.file_path),
+            output_format=output_format,
+            export_file_name=extraction.file_path.name,
+            export_file_size_bytes=extraction.file_size_bytes,
+            export_file_path=str(extraction.file_path),
             extraction_seconds=extraction.total_seconds,
+            query_seconds=extraction.query_seconds,
+            fetch_seconds=extraction.fetch_seconds,
+            serialization_seconds=extraction.serialization_seconds,
+            file_write_seconds=(
+                extraction.csv_write_seconds
+                if output_format == "csv"
+                else extraction.parquet_write_seconds
+            ),
+            parallel_workers=1,
+            fetch_size=fetch_size,
         )
+        if output_format == "parquet":
+            details.update(
+                parquet_file_name=extraction.file_path.name,
+                parquet_file_size_bytes=extraction.file_size_bytes,
+                parquet_file_path=str(extraction.file_path),
+            )
         _record_stage(
             audit,
             target_table,
@@ -229,16 +285,24 @@ def _run_table(
                 key: details[key]
                 for key in (
                     "total_extracted_rows",
-                    "parquet_file_name",
-                    "parquet_file_size_bytes",
-                    "parquet_file_path",
+                    "output_format",
+                    "export_file_name",
+                    "export_file_size_bytes",
+                    "export_file_path",
                     "extraction_seconds",
+                    "query_seconds",
+                    "fetch_seconds",
+                    "serialization_seconds",
+                    "file_write_seconds",
+                    "parallel_workers",
+                    "fetch_size",
                     "extraction_status",
                 )
             },
         )
 
         active_stage = "SNOWFLAKE_LOAD"
+        loading_started = perf_counter()
         raw_load = load_parquet_to_raw_table(
             snowflake_connection,
             database,
@@ -254,6 +318,7 @@ def _run_table(
             snowflake_load_status="SUCCESS",
             loaded_rows=raw_load.loaded_rows,
             raw_load_skipped_as_duplicate=raw_load.skipped_as_duplicate,
+            loading_seconds=perf_counter() - loading_started,
         )
         _record_stage(
             audit,
@@ -264,6 +329,7 @@ def _run_table(
                 key: details[key]
                 for key in (
                     "loaded_rows",
+                    "loading_seconds",
                     "snowflake_load_status",
                     "raw_load_skipped_as_duplicate",
                 )
@@ -271,6 +337,7 @@ def _run_table(
         )
 
         active_stage = "TRANSFORM"
+        transform_started = perf_counter()
         transformed = transform_parquet_raw_to_target(
             snowflake_connection,
             database,
@@ -285,6 +352,7 @@ def _run_table(
             transformed_rows=transformed.inserted_rows,
             rejected_rows=transformed.rejected_rows,
             transform_skipped_as_duplicate=transformed.skipped_as_duplicate,
+            transform_seconds=perf_counter() - transform_started,
         )
         _record_stage(
             audit,
@@ -296,13 +364,16 @@ def _run_table(
                 for key in (
                     "transformed_rows",
                     "rejected_rows",
+                    "transform_seconds",
                     "transform_status",
                     "transform_skipped_as_duplicate",
                 )
             },
         )
         active_stage = "FINALIZE"
-        details["end_time"] = datetime.now().isoformat()
+        details["total_pipeline_seconds"] = perf_counter() - run_started
+        finish_memory_measurement()
+        details["end_time"] = ist_now().isoformat()
         details["status"] = "SUCCESS"
         audit.finish_step(
             table_step,
@@ -310,8 +381,9 @@ def _run_table(
             json.dumps(details, sort_keys=True, default=str),
         )
         logger.info(
-            "Parquet ETL completed for %s: extracted=%s loaded=%s transformed=%s "
+            "%s ETL completed for %s: extracted=%s loaded=%s transformed=%s "
             "rejected=%s file=%s",
+            output_format.upper(),
             target_table,
             extraction.row_count,
             raw_load.loaded_rows,
@@ -321,13 +393,15 @@ def _run_table(
         )
         return details
     except Exception as exc:
+        details["total_pipeline_seconds"] = perf_counter() - run_started
+        finish_memory_measurement()
         error_message = traceback.format_exc()
         failed_stage = active_stage
         details.update(
             status="FAILED",
             failed_stage=failed_stage,
             error=str(exc),
-            end_time=datetime.now().isoformat(),
+            end_time=ist_now().isoformat(),
         )
         stage_key = {
             "EXTRACTION": "extraction_status",
@@ -356,6 +430,7 @@ def _run_table(
         logger.exception("Parquet ETL failed for %s", target_table)
         return details
     finally:
+        finish_memory_measurement()
         if temporary_raw_table is not None:
             try:
                 drop_temporary_raw_table(
@@ -404,8 +479,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 for _, _, rows in selected
             ),
-            f"Starting Parquet ETL for {len(selected)} table(s)",
-            start_time=datetime.now(),
+            f"Starting {args.format.upper()} ETL for {len(selected)} table(s)",
+            start_time=ist_now(),
         )
         source_connection = connect_to_4d()
         results = [
@@ -420,6 +495,8 @@ def main(argv: list[str] | None = None) -> int:
                 table_name,
                 sheet_name,
                 mapping_rows,
+                args.format,
+                args.measure_memory,
             )
             for table_name, sheet_name, mapping_rows in selected
         ]
@@ -453,20 +530,20 @@ def main(argv: list[str] | None = None) -> int:
                     f"loaded={item['loaded_rows']} "
                     f"transformed={item['transformed_rows']} "
                     f"rejected={item['rejected_rows']} "
-                    f"file={item['parquet_file_path']}"
+                    f"file={item['export_file_path']}"
                 )
             )
             logger.info(message)
             print(message)
     except Exception as exc:
-        logger.exception("Parquet ETL pipeline failed")
+        logger.exception("%s ETL pipeline failed", args.format.upper())
         exit_code = 1
         if audit is not None and pipeline_step is not None:
             try:
                 audit.finish_step(
                     pipeline_step,
                     "FAILED",
-                    f"Parquet ETL pipeline failed: {exc}",
+                    f"{args.format.upper()} ETL pipeline failed: {exc}",
                     traceback.format_exc(),
                 )
             except Exception:

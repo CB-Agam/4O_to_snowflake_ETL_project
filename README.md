@@ -55,7 +55,41 @@ batch size when needed:
 py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 ```
 
-## Single-file Parquet end-to-end ETL
+## Extraction-only CSV export
+
+Extract one mapped table to a local CSV without running exception handling,
+transformations, or any Snowflake upload. The default fetch/task size is 10,000
+rows and the default worker count is 3:
+
+```powershell
+.\env_etl\Scripts\python.exe scripts\extract_table_to_csv.py `
+  --table "Account Contacts" `
+  --fetch-size 10000 `
+  --workers 2 `
+  --export-dir exports
+```
+
+When the mapping has an integer-compatible primary-key column, extraction
+uses separate 4D connections and disjoint half-open key ranges. For a
+composite key, an integer-compatible mapped component can be used to divide
+the ranges; duplicate component values remain together in the same range.
+Each worker fetches its range in 10,000-row ODBC batches. When no primary key
+is mapped (or no mapped key component is integer-compatible),
+the source is read through one 4D cursor in 10,000-row tasks; up to three
+worker threads process those tasks, and later tasks are scheduled as workers
+finish. This avoids unsupported row-number SQL but does not parallelize the 4D
+read for a table without a key.
+
+Both paths reconcile row counts and merge completed task files in order before
+publishing one UTF-8 CSV at
+`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.csv`. Only the final file is
+left for the later load step. The source table should remain stable during
+extraction. Concurrent 4D connections for primary-key parallel extraction
+remain driver/server dependent; use `--workers 1` until support is confirmed
+in a development environment. The command does not open a Snowflake
+connection.
+
+## Chunked file-based end-to-end ETL
 
 Run the complete export, temporary staging load, and typed transform flow with one command.
 The existing `run_initial_etl.py` command remains unchanged.
@@ -79,12 +113,12 @@ if any table failed:
 ```
 
 The runner uses one 4D connection, one Snowflake connection, and one run ID
-for all selected tables. Each table gets one completed Parquet file, is copied
+for all selected tables. By default, each table gets one completed Parquet file, is copied
 into a session-scoped temporary VARCHAR staging table, and then has valid rows
 published to the mapped target. The temporary table is dropped after the
 transform, so this end-to-end command does not create a permanent
 `<TARGET_TABLE>_RAW` table. Invalid mapped values and their raw row values are
-recorded in `ETL_DATA_QUALITY_ERRORS`; the local Parquet file remains available
+recorded in `ETL_DATA_QUALITY_ERRORS`; the local export file remains available
 for later correction and reprocessing. Existing target snapshots are preserved
 under generated `<TARGET_TABLE>_HIST_<ID>` names. Per-table extraction, load,
 transform, row counts, file details, and errors are recorded in
@@ -96,11 +130,44 @@ If a nonempty table has zero valid rows, the transform fails with counts and
 sample messages grouped by invalid column and error type. It keeps the rejected
 rows in `ETL_DATA_QUALITY_ERRORS`, does not publish an empty target snapshot,
 and allows the runner to continue with the next selected table.
-For mapped Snowflake `TIME` columns, an all-zero 4D interval such as
-`0:0:0:0:0` is normalized to `NULL` in the Parquet file before upload. This
-avoids rejecting every row on a zero-duration placeholder while keeping the
-mapped Snowflake column as `TIME`. Other nonzero interval strings are retained
-and still require a mapping/conversion decision if they are not valid times.
+Choose CSV output with `--format csv`. It streams the same mapped rows into
+UTF-8 CSV using standard quoting, preserves newlines/quotes/commas, validates
+the header and record widths, and reconciles row counts before marking the
+file complete. SQL NULL is encoded with a reserved marker and restored as NULL
+by Snowflake `COPY INTO`; a source value matching that marker causes extraction
+to fail rather than being corrupted. The current path deliberately uses one
+4D connection and one worker because the installed 4D ODBC driver's
+multi-connection/thread-safety behavior has not been verified.
+
+The CLI accepts `--fetch-size` values such as 5000, 10000, 25000, or 50000.
+Extraction reports query, fetch, serialization, and file-write durations.
+`--measure-memory` additionally reports peak Python heap allocation; it does
+not include native ODBC/PyArrow allocations. Use the same settings for
+controlled benchmarks and compare row counts before considering a batch-size
+or concurrency change.
+
+For an initial development-table check and a sample batch-size run:
+
+```powershell
+.\env_etl\Scripts\python.exe scripts\run_parquet_etl.py `
+  --table "Account Contacts" `
+  --format csv `
+  --fetch-size 5000 `
+  --export-dir exports `
+  --database "DEV_DATABASE" `
+  --schema "DEV_SCHEMA"
+```
+
+Repeat with `--fetch-size 10000`, `25000`, and `50000` against the same
+non-production source and target conditions. Use a distinct ETL run for every
+measurement; the flow publishes a full target snapshot and retains the prior
+snapshot under its generated history name.
+
+Four-part/five-part 4D interval text is preserved rather than assumed to be a
+clock time or changed to NULL. If it cannot be converted to the mapped
+Snowflake type, it is rejected and quarantined with the original value and
+mapped source key where available. Confirm the 4D interval representation
+before adding a conversion rule.
 
 The runner uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` from `.env`; pass
 `--database` and `--schema` to override them. The mapping worksheet is inferred

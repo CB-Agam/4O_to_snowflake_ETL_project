@@ -74,13 +74,6 @@ def _normalize_timestamp_text(value: str, column_name: str) -> str | None:
     value = value.strip()
     if not value:
         return value
-    if re.fullmatch(r"0{1,2}/0{1,2}/0{1,4}\s+0{1,2}:0{2}:0{2}", value):
-        logger.debug(
-            "Replacing zero-date timestamp with NULL for %s: %r",
-            column_name,
-            value,
-        )
-        return None
 
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -142,15 +135,6 @@ def _mapped_value_as_text(value: Any, snowflake_type: str, column_name: str) -> 
     normalized_type = normalized_type.strip().upper()
     if normalized_type.startswith("TIMESTAMP"):
         return _normalize_timestamp_text(text, column_name)
-    if normalized_type.startswith("TIME") and re.fullmatch(
-        r"0+(?::0+){4}", text.strip()
-    ):
-        logger.debug(
-            "Replacing zero interval with NULL for %s: %r",
-            column_name,
-            text,
-        )
-        return None
     return text
 
 

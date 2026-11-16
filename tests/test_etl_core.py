@@ -3,12 +3,14 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime
 from unittest.mock import MagicMock, Mock, patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from config.logging_config import configure_logging
-from etl.audit import SnowflakeAuditLogger
+from etl.audit import SnowflakeAuditLogger, ist_now
 from etl.ddl import (
     build_create_table_sql,
     build_drop_status_column_sql,
@@ -32,6 +34,13 @@ from scripts.run_initial_etl import _parse_args
 
 
 class EtlCoreTests(unittest.TestCase):
+    def test_ist_now_returns_naive_snowflake_ntz_wall_time(self):
+        value = ist_now()
+        expected = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+
+        self.assertIsNone(value.tzinfo)
+        self.assertLess(abs((value - expected).total_seconds()), 2)
+
     def test_snowflake_audit_logger_creates_table_and_records_events(self):
         connection = Mock()
         cursor = Mock()
@@ -60,7 +69,10 @@ class EtlCoreTests(unittest.TestCase):
             insert_values[:7],
             (audit.run_id, 1, "REPORTS", "INSERT_TARGET_DATA", "SUCCESS", "Loaded rows", None),
         )
-        self.assertEqual(insert_values[8], "SUCCESS")
+        self.assertIsNotNone(insert_values[7])
+        self.assertIsNotNone(insert_values[8])
+        self.assertIsNone(insert_values[7].tzinfo)
+        self.assertIsNone(insert_values[8].tzinfo)
         self.assertEqual(cursor.close.call_count, 2)
 
     def test_each_audit_run_has_new_run_id_and_step_numbers_restart(self):
@@ -101,7 +113,8 @@ class EtlCoreTests(unittest.TestCase):
         self.assertEqual(failure_values[:2], ("FAILED", "EXTRACT_SOURCE_DATA failed: test step failure"))
         self.assertIn("RuntimeError", failure_values[2])
         self.assertIn("Traceback (most recent call last)", failure_values[2])
-        self.assertEqual(failure_values[3:], (audit.run_id, 1))
+        self.assertIsNotNone(failure_values[3])
+        self.assertEqual(failure_values[4:], (audit.run_id, 1))
 
     def test_snowflake_audit_logger_records_step_start_and_success(self):
         connection = Mock()
@@ -116,7 +129,8 @@ class EtlCoreTests(unittest.TestCase):
         success_values = cursor.execute.call_args_list[1].args[1]
         self.assertEqual(started_values[3:5], ("LOAD_MAPPING", "RUNNING"))
         self.assertEqual(success_values[:2], ("SUCCESS", "LOAD_MAPPING completed successfully"))
-        self.assertEqual(success_values[3:], (audit.run_id, 1))
+        self.assertIsNotNone(success_values[3])
+        self.assertEqual(success_values[4:], (audit.run_id, 1))
 
     def test_snowflake_audit_logger_marks_interrupted_steps(self):
         connection = Mock()
@@ -132,7 +146,8 @@ class EtlCoreTests(unittest.TestCase):
 
         interrupted_values = cursor.execute.call_args_list[-1].args[1]
         self.assertEqual(interrupted_values[:2], ("INTERRUPTED", "EXTRACT_SOURCE_DATA interrupted"))
-        self.assertEqual(interrupted_values[3:], (audit.run_id, 1))
+        self.assertIsNotNone(interrupted_values[3])
+        self.assertEqual(interrupted_values[4:], (audit.run_id, 1))
 
     @patch("scripts.run_initial_etl.load_query_to_snowflake_in_batches", return_value=1)
     @patch("scripts.run_initial_etl.table_exists_in_snowflake", return_value=True)

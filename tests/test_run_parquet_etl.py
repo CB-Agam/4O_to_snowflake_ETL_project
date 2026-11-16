@@ -30,10 +30,98 @@ def _export_result(target_table: str) -> SimpleNamespace:
         file_path=Path(f"exports\\{target_table.upper()}\\run-123\\{target_table.lower()}.parquet"),
         file_size_bytes=1024,
         total_seconds=3.5,
+        query_seconds=0.5,
+        fetch_seconds=1.0,
+        serialization_seconds=0.5,
+        parquet_write_seconds=1.0,
+        csv_write_seconds=1.0,
     )
 
 
 class RunParquetEtlTests(unittest.TestCase):
+    def test_csv_format_uses_csv_export_and_existing_load_transform_path(self):
+        source_connection = Mock()
+        snowflake_connection = Mock()
+        audit = Mock()
+        audit.run_id = "run-csv-123"
+        audit.record.return_value = 1
+        mapping_rows = _mapping("CUSTOMERS")
+        extraction = SimpleNamespace(
+            run_id="run-csv-123",
+            row_count=2,
+            file_path=Path("exports\\CUSTOMERS\\run-csv-123\\customers.csv"),
+            file_size_bytes=128,
+            total_seconds=2.5,
+            query_seconds=0.5,
+            fetch_seconds=1.0,
+            serialization_seconds=0.5,
+            csv_write_seconds=0.5,
+        )
+        raw_load = SimpleNamespace(
+            loaded_rows=2,
+            skipped_as_duplicate=False,
+            raw_table='"DW_TEST"."RAW"."ETL_CSV_RAW_TEST"',
+        )
+        transformed = SimpleNamespace(
+            inserted_rows=2,
+            rejected_rows=0,
+            skipped_as_duplicate=False,
+        )
+
+        with (
+            patch(
+                "scripts.run_parquet_etl.export_table_to_csv",
+                return_value=extraction,
+            ) as export_csv,
+            patch("scripts.run_parquet_etl.export_table_to_parquet") as export_parquet,
+            patch(
+                "scripts.run_parquet_etl.load_parquet_to_raw_table",
+                return_value=raw_load,
+            ) as load_raw,
+            patch(
+                "scripts.run_parquet_etl.transform_parquet_raw_to_target",
+                return_value=transformed,
+            ) as transform,
+            patch("scripts.run_parquet_etl.drop_temporary_raw_table"),
+        ):
+            result = run_parquet_etl._run_table(
+                source_connection,
+                snowflake_connection,
+                audit,
+                "DW_TEST",
+                "RAW",
+                Path("exports"),
+                10_000,
+                "Customers",
+                "Customers",
+                mapping_rows,
+                output_format="csv",
+                measure_memory=True,
+            )
+
+        self.assertEqual(result["status"], "SUCCESS")
+        self.assertEqual(result["output_format"], "csv")
+        self.assertEqual(result["total_extracted_rows"], 2)
+        self.assertGreater(result["peak_python_memory_bytes"], 0)
+        export_csv.assert_called_once_with(
+            source_connection,
+            mapping_rows,
+            Path("exports"),
+            "run-csv-123",
+            fetch_size=10_000,
+        )
+        export_parquet.assert_not_called()
+        load_raw.assert_called_once_with(
+            snowflake_connection,
+            "DW_TEST",
+            "RAW",
+            mapping_rows,
+            extraction.file_path,
+            "run-csv-123",
+            persistent_raw=False,
+        )
+        self.assertEqual(transform.call_args.args[5], "customers.csv")
+
     def test_runs_export_load_transform_with_shared_run_id(self):
         with (
             patch("scripts.run_parquet_etl.configure_logging"),
@@ -200,6 +288,14 @@ class RunParquetEtlTests(unittest.TestCase):
             run_parquet_etl._parse_args(
                 ["--table", "Customers", "--fetch-size", "0"]
             )
+
+    def test_cli_selects_csv_format_and_optional_memory_measurement(self):
+        args = run_parquet_etl._parse_args(
+            ["--table", "Customers", "--format", "csv", "--measure-memory"]
+        )
+
+        self.assertEqual(args.format, "csv")
+        self.assertTrue(args.measure_memory)
 
 
 if __name__ == "__main__":

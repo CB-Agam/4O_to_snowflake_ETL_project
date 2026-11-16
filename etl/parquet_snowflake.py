@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import csv
 import logging
 import re
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ import pyarrow.parquet as pq
 
 from etl.incremental import acquire_table_run_lock, release_table_run_lock
 from etl.load import _local_file_uri
+from etl.csv_export import CSV_NULL_MARKER
 
 logger = logging.getLogger(__name__)
 _RAW_METADATA_COLUMNS = {
@@ -121,6 +123,36 @@ def _validate_parquet_file(
             f"found {key_values.get('target_table')!r}"
         )
     return int(metadata.num_rows)
+
+
+def _validate_csv_file(
+    file_path: Path,
+    target_columns: Sequence[str],
+) -> int:
+    if not file_path.is_file():
+        raise FileNotFoundError(f"CSV file does not exist: {file_path}")
+    with file_path.open("r", encoding="utf-8-sig", newline="") as source:
+        reader = csv.reader(source, strict=True)
+        try:
+            header = next(reader)
+        except StopIteration as exc:
+            raise ValueError(f"CSV export is empty: {file_path}") from exc
+        if [column.casefold() for column in header] != [
+            column.casefold() for column in target_columns
+        ]:
+            raise ValueError(
+                f"CSV columns do not match the mapping: expected "
+                f"{list(target_columns)}, found {header}"
+            )
+        rows = 0
+        for row in reader:
+            if len(row) != len(target_columns):
+                raise ValueError(
+                    f"CSV row {rows + 2} has {len(row)} fields; "
+                    f"expected {len(target_columns)}"
+                )
+            rows += 1
+    return rows
 
 
 def _ensure_raw_target(
@@ -298,12 +330,18 @@ def load_parquet_to_raw_table(
     target_table, target_columns = _mapped_target_columns(mapping_rows)
     run_component = _safe_stage_component(run_id, "Run ID")
     target_component = _safe_stage_component(target_table, "Target table")
-    parquet_rows = _validate_parquet_file(
-        file_path,
-        target_columns,
-        run_component,
-        target_table,
-    )
+    file_type = file_path.suffix.casefold()
+    if file_type == ".parquet":
+        file_rows = _validate_parquet_file(
+            file_path,
+            target_columns,
+            run_component,
+            target_table,
+        )
+    elif file_type == ".csv":
+        file_rows = _validate_csv_file(file_path, target_columns)
+    else:
+        raise ValueError(f"Unsupported export file type: {file_path.suffix!r}")
     file_size = file_path.stat().st_size
     digest = _file_sha256(file_path)
     raw_table_name = (
@@ -347,7 +385,7 @@ def load_parquet_to_raw_table(
             file_path,
             digest,
             file_size,
-            parquet_rows,
+            file_rows,
             skip_successful=persistent_raw,
         )
         if skipped_rows is not None:
@@ -358,7 +396,7 @@ def load_parquet_to_raw_table(
                 file_path=file_path,
                 file_sha256=digest,
                 file_size_bytes=file_size,
-                parquet_rows=parquet_rows,
+                parquet_rows=file_rows,
                 loaded_rows=skipped_rows,
                 skipped_as_duplicate=True,
             )
@@ -404,11 +442,20 @@ def load_parquet_to_raw_table(
                 message = row[message_index] if message_index is not None else status
                 raise RuntimeError(f"Snowflake stage upload failed: {message}")
 
-        cursor.execute(
-            f"COPY INTO {stage_table} FROM {stage_location} "
-            f"FILES = ('{stage_file_name}') "
+        copy_file_format = (
             "FILE_FORMAT=(TYPE=PARQUET) "
             "MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE"
+            if file_type == ".parquet"
+            else (
+                "FILE_FORMAT=(TYPE=CSV SKIP_HEADER=1 "
+                "FIELD_OPTIONALLY_ENCLOSED_BY='\"' "
+                f"NULL_IF=('{CSV_NULL_MARKER}') "
+                "EMPTY_FIELD_AS_NULL=FALSE ENCODING='UTF8')"
+            )
+        )
+        cursor.execute(
+            f"COPY INTO {stage_table} FROM {stage_location} "
+            f"FILES = ('{stage_file_name}') {copy_file_format}"
         )
         copy_columns = [
             str(description[0]).casefold()
@@ -427,9 +474,9 @@ def load_parquet_to_raw_table(
         )
         if copy_errors:
             raise RuntimeError(f"Snowflake Parquet COPY reported {copy_errors} error(s)")
-        if copy_loaded_rows != parquet_rows:
+        if copy_loaded_rows != file_rows:
             raise RuntimeError(
-                f"Snowflake loaded {copy_loaded_rows} of {parquet_rows} Parquet rows"
+                f"Snowflake loaded {copy_loaded_rows} of {file_rows} {file_type[1:].upper()} rows"
             )
 
         insert_columns = [
@@ -494,7 +541,7 @@ def load_parquet_to_raw_table(
             file_path=file_path,
             file_sha256=digest,
             file_size_bytes=file_size,
-            parquet_rows=parquet_rows,
+            parquet_rows=file_rows,
             loaded_rows=copy_loaded_rows,
             skipped_as_duplicate=False,
         )

@@ -5,7 +5,6 @@ import logging
 import sys
 import traceback
 from collections.abc import Sequence
-from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +18,7 @@ from config.logging_config import configure_logging
 from connections.fourd_connection import connect_to_4d
 from connections.snowflake_connection import connect_to_snowflake
 from etl.audit import SnowflakeAuditLogger
+from etl.audit import ist_now
 from etl.ddl import (
     build_create_table_sql,
     build_drop_status_column_sql,
@@ -66,8 +66,8 @@ def run_for_table(
         selected_target_names = list(target_table)
     audit_table_name = ", ".join(selected_target_names) or None
 
-    pipeline_started_at = datetime.now()
-    snowflake_connect_started_at = datetime.now()
+    pipeline_started_at = ist_now()
+    snowflake_connect_started_at = ist_now()
     snowflake_conn = connect_to_snowflake()
     audit = SnowflakeAuditLogger(
         snowflake_conn,
@@ -77,7 +77,7 @@ def run_for_table(
     audit_ready = False
     pipeline_step_number = None
     try:
-        audit_table_started_at = datetime.now()
+        audit_table_started_at = ist_now()
         audit.ensure_table()
         audit_ready = True
         pipeline_step_number = audit.record(

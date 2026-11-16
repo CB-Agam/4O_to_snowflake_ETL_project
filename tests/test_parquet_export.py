@@ -98,7 +98,7 @@ class ParquetExportTests(unittest.TestCase):
                 [
                     {
                         "MSG_NO": "1",
-                        "MSGDATE": None,
+                        "MSGDATE": "00/00/0 00:00:00",
                         "AMOUNT": "308905.57999999996",
                     },
                     {
@@ -129,15 +129,17 @@ class ParquetExportTests(unittest.TestCase):
         )
         self.assertEqual(
             _normalize_timestamp_text("00/00/0 00:00:00", "CREATED_ON"),
-            None,
+            "00/00/0 00:00:00",
         )
 
-    def test_converts_zero_interval_to_null_for_time_columns(self):
-        self.assertIsNone(
-            _mapped_value_as_text("0:0:0:0:0", "TIME(0)", "CREATED_AT")
+    def test_preserves_4d_interval_values_for_safe_target_validation(self):
+        self.assertEqual(
+            _mapped_value_as_text("0:0:0:0:0", "TIME(0)", "CREATED_AT"),
+            "0:0:0:0:0",
         )
-        self.assertIsNone(
-            _mapped_value_as_text(" 00:00:00:00:00 ", "TIME", "MODIFIED_AT")
+        self.assertEqual(
+            _mapped_value_as_text(" 00:00:00:00:00 ", "TIME", "MODIFIED_AT"),
+            " 00:00:00:00:00 ",
         )
         self.assertEqual(
             _mapped_value_as_text("0:0:27:0:0", "TIME(0)", "CREATED_AT"),

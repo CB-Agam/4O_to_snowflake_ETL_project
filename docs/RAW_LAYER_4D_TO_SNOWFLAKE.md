@@ -35,7 +35,8 @@ The diagram is also available as an editable vector source:
 | Python ETL Runner | `scripts/run_initial_etl.py` parses command-line options, reads mappings, coordinates Snowflake and 4D operations, and determines the final run result. |
 | Mapping workbook | `4D_to_Snowflake (1-50 tables mapping).xlsx` describes source tables and columns, target names and types, and mapping constraints. A selected target uses its matching worksheet; an all-table run uses the `Snowflake_table_names` worksheet. |
 | 4D source | `connections/fourd_connection.py` opens an ODBC connection. The runner issues a mapped `SELECT` query against the source table. |
-| In-memory DataFrame | `pandas.read_sql` holds the extracted rows in memory. The runner renames the returned columns to Snowflake target-column names. It does not write an intermediate Excel or JSON data file. |
+| Full-load extraction | `etl/load.py` uses `fetchmany()` batches, writes temporary JSON chunks, and bulk-loads them using Snowflake `PUT` and `COPY INTO`. The optional file-based runner streams to one Parquet or CSV file. |
+| Extraction-only CSV | `scripts/extract_table_to_csv.py` writes one final CSV. Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams 10,000-row tasks to a bounded CSV worker pool. This command does not connect to Snowflake. |
 | Snowflake raw table | `connections/snowflake_connection.py` opens the Snowflake connection. The runner creates or prepares the mapped target table and inserts the rows. |
 | `ETL_PIPELINE_LOG` | `etl/audit.py` records pipeline and step audit events in the configured Snowflake database and schema. |
 | Incremental state and batch tables | `etl/incremental.py` creates `ETL_INCREMENTAL_TABLE_STATE`, `ETL_SOURCE_ROW_STATE`, and `ETL_INCREMENTAL_BATCH_LOG` when incremental mode is used. |
@@ -59,6 +60,44 @@ py -3.12 scripts\run_initial_etl.py --table CLAIMS --incremental --overlap-secon
 
 Incremental mode is opt-in. The overlap defaults to 86,400 seconds (24 hours)
 and can be set to a non-negative number of seconds.
+
+## Extraction-only CSV export
+
+The separate extraction command can be used without running validation,
+exception recovery, transformation, or Snowflake loading:
+
+```powershell
+py -3.12 scripts\extract_table_to_csv.py `
+  --table ACCOUNT_CONTACTS `
+  --fetch-size 10000 `
+  --workers 2 `
+  --export-dir exports
+```
+
+`--fetch-size` defaults to 10,000 rows, and `--workers` accepts 1-3 (default
+3). With a mapped integer-compatible primary-key column, extraction uses
+separate 4D connections and disjoint numeric key ranges; each worker fetches
+in 10,000-row batches. For a composite key, an integer-compatible mapped
+component may be used for range partitioning; rows sharing a component value
+stay in the same range. The 4D ODBC driver's concurrent connection behavior
+remains unverified, so begin with one worker and use multiple workers only
+after confirming support against a development database.
+
+If no primary key is mapped, the exporter counts the table and reads through
+one 4D cursor in 10,000-row tasks. Up to three workers process these extracted
+tasks concurrently, and more tasks are scheduled as workers finish. Because
+the server rejected `ROW_NUMBER()`/`ROWNUM` and paging syntax has not been
+confirmed, this path does not parallelize source reads or use `OFFSET`.
+If no mapped primary-key component is integer-compatible, the same counted,
+single-cursor task path is used. CSV headers, row widths, and source/extracted
+row counts are checked before completion. Keep the table stable during export
+because row-count reconciliation cannot detect every simultaneous source
+change.
+
+Both paths merge task files in order and leave one final file at
+`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.csv`. SQL NULL is represented
+by the export's reserved marker. The final file path and row count are printed
+for the subsequent loading stage.
 
 ## Execution sequence
 
@@ -202,6 +241,12 @@ replacement.
 `--batch-size` rows (default 50,000) for full mode. Each chunk is serialized
 to a temporary JSON file and staged in Snowflake.
 
+The separate end-to-end file runner `scripts/run_parquet_etl.py` streams
+mapped rows to one Parquet file by default; `--format csv` selects a validated
+UTF-8 CSV file. Both file formats use one 4D connection and stream fetch
+batches. CSV reserves a marker for SQL NULL and rejects source values that
+collide with it. Files are row-count checked before being marked complete.
+
 **Output and next step:** Full mode keeps only one source chunk in memory at a
 time and stages it before publishing the complete load. Incremental mode
 continues to use its own change-detection strategy.
@@ -309,8 +354,8 @@ created and migrated by `SnowflakeAuditLogger.ensure_table()` in `etl/audit.py`.
 | `STATUS` | Current or final status for the event. |
 | `MESSAGE` | Human-readable step or result message. |
 | `ERROR_MESSAGE` | Error details; failed wrapped steps store a traceback. |
-| `START_TIME` | Supplied step start time, or the current Snowflake time when the event is inserted. |
-| `END_TIME` | NULL while a `RUNNING` event is active; set when the event is finalized. |
+| `START_TIME` | Step start time in the local Asia/Kolkata wall-clock timezone, stored as `TIMESTAMP_NTZ`. |
+| `END_TIME` | NULL while a `RUNNING` event is active; set in the same Asia/Kolkata timezone when the event is finalized. |
 | `TIME_STAMP` | Event creation time, with a `CURRENT_TIMESTAMP()` default. |
 
 The logger inserts one row when a wrapped step starts with `STATUS = 'RUNNING'`

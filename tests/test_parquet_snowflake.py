@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import csv
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -9,6 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from etl.parquet_snowflake import load_parquet_to_raw_table
+from etl.csv_export import CSV_NULL_MARKER
 
 
 MAPPING = [
@@ -78,6 +80,75 @@ def _mock_cursor_for_success(cursor, row_count=2):
 
 
 class ParquetSnowflakeTests(unittest.TestCase):
+    @patch("etl.parquet_snowflake.release_table_run_lock")
+    @patch("etl.parquet_snowflake.acquire_table_run_lock", return_value={"owner": "lock"})
+    def test_loads_validated_csv_to_raw_table_with_null_marker(
+        self, _acquire_lock, _release_lock
+    ):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            csv_path = Path(temporary_directory) / "messages.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as output:
+                writer = csv.writer(output, lineterminator="\n")
+                writer.writerow(["MSG_NO", "MSGDATE"])
+                writer.writerow(["1", "2006-03-21 00:00:00"])
+                writer.writerow(["2", CSV_NULL_MARKER])
+            cursor = Mock()
+            cursor.fetchall.side_effect = [
+                [],
+                [("UPLOADED", "ok")],
+                [(2, 0)],
+            ]
+            cursor.execute.return_value = cursor
+            cursor.fetchone.return_value = (2,)
+
+            def execute(sql, *_args):
+                if sql.startswith("PUT "):
+                    cursor.description = [("status",), ("message",)]
+                elif sql.startswith("COPY INTO"):
+                    cursor.description = [("rows_loaded",), ("errors_seen",)]
+                return cursor
+
+            cursor.execute.side_effect = execute
+            connection = Mock()
+            connection.cursor.return_value = cursor
+
+            result = load_parquet_to_raw_table(
+                connection,
+                "DW_TEST",
+                "RAW",
+                MAPPING,
+                csv_path,
+                "run-001",
+                persistent_raw=False,
+            )
+
+            self.assertEqual(result.loaded_rows, 2)
+            self.assertEqual(result.parquet_rows, 2)
+            sql = [call.args[0] for call in cursor.execute.call_args_list]
+            copy_sql = next(item for item in sql if item.startswith("COPY INTO "))
+            self.assertIn("TYPE=CSV", copy_sql)
+            self.assertIn("SKIP_HEADER=1", copy_sql)
+            self.assertIn(CSV_NULL_MARKER, copy_sql)
+            self.assertIn("EMPTY_FIELD_AS_NULL=FALSE", copy_sql)
+
+    def test_rejects_csv_header_mismatch_before_snowflake_connection_use(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            csv_path = Path(temporary_directory) / "messages.csv"
+            csv_path.write_text("MSGDATE,MSG_NO\n", encoding="utf-8")
+            connection = Mock()
+
+            with self.assertRaisesRegex(ValueError, "CSV columns do not match"):
+                load_parquet_to_raw_table(
+                    connection,
+                    "DW_TEST",
+                    "RAW",
+                    MAPPING,
+                    csv_path,
+                    "run-001",
+                )
+
+            connection.cursor.assert_not_called()
+
     @patch("etl.parquet_snowflake.release_table_run_lock")
     @patch("etl.parquet_snowflake.acquire_table_run_lock", return_value={"owner": "lock"})
     def test_loads_parquet_into_varchar_raw_table_and_tracks_file(
