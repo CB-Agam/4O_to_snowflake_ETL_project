@@ -16,6 +16,7 @@ from config.logging_config import configure_logging
 from connections.fourd_connection import close_4d_connection, connect_to_4d
 from etl.csv_export import export_table_to_csv_parallel
 from etl.metadata import load_metadata_from_excel
+from etl.parallel_parquet_export import export_table_to_parquet_parallel
 
 DEFAULT_EXCEL_PATH = PROJECT_ROOT / "4D_to_Snowflake (1-50 tables mapping).xlsx"
 DEFAULT_EXPORT_DIR = PROJECT_ROOT / "exports"
@@ -61,7 +62,8 @@ def _find_mapping_sheet(excel_path: Path, table_name: str) -> str:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract one mapped 4D table to one final local CSV file. "
+            "Extract one mapped 4D table to one final local Parquet file "
+            "(or CSV with --format csv). "
             "This command does not connect to or write to Snowflake."
         )
     )
@@ -90,6 +92,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_worker_count,
         default=3,
         help="Workers for extraction tasks (1-3; default: 3)",
+    )
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("parquet", "csv"),
+        default="parquet",
+        help="Output file format (default: parquet)",
     )
     parser.add_argument(
         "--export-dir",
@@ -123,40 +132,71 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         source_connection = connect_to_4d()
-        result = export_table_to_csv_parallel(
-            source_connection,
-            mapping_rows,
-            args.export_dir,
-            args.run_id or str(uuid4()),
-            connection_factory=connect_to_4d,
-            fetch_size=args.fetch_size,
-            worker_count=args.workers,
-        )
-        logger.info(
-            "4D CSV extraction completed: table=%s rows=%s workers=%s "
-            "fetch_size=%s query_seconds=%.3f fetch_seconds=%.3f "
-            "serialization_seconds=%.3f csv_write_seconds=%.3f "
-            "total_seconds=%.3f files=%s",
-            result.target_table,
-            result.row_count,
-            result.worker_count,
-            result.fetch_size,
-            result.query_seconds,
-            result.fetch_seconds,
-            result.serialization_seconds,
-            result.csv_write_seconds,
-            result.total_seconds,
-            ";".join(str(path) for path in result.file_paths),
-        )
+        run_id = args.run_id or str(uuid4())
+        if args.output_format == "parquet":
+            result = export_table_to_parquet_parallel(
+                source_connection,
+                mapping_rows,
+                args.export_dir,
+                run_id,
+                connection_factory=connect_to_4d,
+                fetch_size=args.fetch_size,
+                worker_count=args.workers,
+            )
+            logger.info(
+                "4D Parquet extraction completed: table=%s rows=%s workers=%s "
+                "fetch_size=%s query_seconds=%.3f fetch_seconds=%.3f "
+                "serialization_seconds=%.3f parquet_write_seconds=%.3f "
+                "total_seconds=%.3f file=%s",
+                result.target_table,
+                result.row_count,
+                result.worker_count,
+                result.fetch_size,
+                result.query_seconds,
+                result.fetch_seconds,
+                result.serialization_seconds,
+                result.parquet_write_seconds,
+                result.total_seconds,
+                result.file_path,
+            )
+            output_paths = (result.file_path,)
+        else:
+            result = export_table_to_csv_parallel(
+                source_connection,
+                mapping_rows,
+                args.export_dir,
+                run_id,
+                connection_factory=connect_to_4d,
+                fetch_size=args.fetch_size,
+                worker_count=args.workers,
+            )
+            logger.info(
+                "4D CSV extraction completed: table=%s rows=%s workers=%s "
+                "fetch_size=%s query_seconds=%.3f fetch_seconds=%.3f "
+                "serialization_seconds=%.3f csv_write_seconds=%.3f "
+                "total_seconds=%.3f files=%s",
+                result.target_table,
+                result.row_count,
+                result.worker_count,
+                result.fetch_size,
+                result.query_seconds,
+                result.fetch_seconds,
+                result.serialization_seconds,
+                result.csv_write_seconds,
+                result.total_seconds,
+                ";".join(str(path) for path in result.file_paths),
+            )
+            output_paths = result.file_paths
         print(
-            f"Extraction completed: table={result.target_table} "
-            f"rows={result.row_count} workers={result.worker_count} "
-            f"fetch_size={result.fetch_size} files={len(result.file_paths)}"
+            f"Extraction completed: format={args.output_format} "
+            f"table={result.target_table} rows={result.row_count} "
+            f"workers={result.worker_count} fetch_size={result.fetch_size} "
+            f"files={len(output_paths)}"
         )
-        for path in result.file_paths:
+        for path in output_paths:
             print(path)
     except Exception:
-        logger.exception("4D CSV extraction failed for %s", args.table)
+        logger.exception("4D extraction failed for %s", args.table)
         exit_code = 1
     finally:
         if source_connection is not None:

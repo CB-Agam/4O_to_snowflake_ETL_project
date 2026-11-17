@@ -13,6 +13,7 @@ from etl.parquet_export import (
     _normalize_timestamp_text,
     export_table_to_parquet,
 )
+from etl.parallel_parquet_export import export_table_to_parquet_parallel
 
 
 def _messages_mapping():
@@ -43,6 +44,112 @@ def _messages_mapping():
 
 
 class ParquetExportTests(unittest.TestCase):
+    def test_parallel_export_writes_a_single_parquet_file_without_primary_key(self):
+        count_before = Mock()
+        count_before.fetchone.return_value = (3,)
+        source_cursor = Mock()
+        source_cursor.fetchmany.side_effect = [
+            [
+                (1, "2006-03-21 00:00:00", Decimal("1.25")),
+                (2, "2006-03-22 00:00:00", Decimal("2.50")),
+            ],
+            [(3, "2006-03-23 00:00:00", None)],
+            [],
+        ]
+        count_after = Mock()
+        count_after.fetchone.return_value = (3,)
+        connection = Mock()
+        connection.cursor.side_effect = [count_before, source_cursor, count_after]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = export_table_to_parquet_parallel(
+                connection,
+                _messages_mapping(),
+                temporary_directory,
+                run_id="parallel-no-key",
+                connection_factory=Mock(),
+                fetch_size=2,
+                worker_count=3,
+            )
+            self.assertEqual(result.row_count, 3)
+            self.assertEqual(result.worker_count, 2)
+            self.assertEqual(result.fetch_size, 2)
+            self.assertEqual(result.file_path.suffix, ".parquet")
+            self.assertEqual(
+                [row["MSG_NO"] for row in pq.read_table(result.file_path).to_pylist()],
+                ["1", "2", "3"],
+            )
+            self.assertEqual(
+                list(Path(temporary_directory).rglob("*.parquet")),
+                [result.file_path],
+            )
+            self.assertEqual(
+                list(Path(temporary_directory).rglob("*.partial")),
+                [],
+            )
+            source_cursor.fetchmany.assert_any_call(2)
+
+    def test_parallel_export_uses_distinct_connections_for_primary_key_ranges(self):
+        mapping = _messages_mapping()
+        mapping[0]["constraint"] = "PK"
+        bounds_cursor = Mock()
+        bounds_cursor.fetchone.side_effect = [
+            (4,),
+            (1,),
+            (4,),
+            (2,),
+            (3,),
+            (2,),
+            (2,),
+        ]
+        count_after = Mock()
+        count_after.fetchone.return_value = (4,)
+        source_connection = Mock()
+        source_connection.cursor.side_effect = [bounds_cursor, count_after]
+
+        first_cursor = Mock()
+        first_cursor.fetchmany.side_effect = [
+            [
+                (1, "2006-03-21 00:00:00", Decimal("1")),
+                (2, "2006-03-22 00:00:00", Decimal("2")),
+            ],
+            [],
+        ]
+        second_cursor = Mock()
+        second_cursor.fetchmany.side_effect = [
+            [
+                (3, "2006-03-23 00:00:00", Decimal("3")),
+                (4, "2006-03-24 00:00:00", Decimal("4")),
+            ],
+            [],
+        ]
+        first_connection = Mock()
+        first_connection.cursor.return_value = first_cursor
+        second_connection = Mock()
+        second_connection.cursor.return_value = second_cursor
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = export_table_to_parquet_parallel(
+                source_connection,
+                mapping,
+                temporary_directory,
+                run_id="parallel-key",
+                connection_factory=Mock(
+                    side_effect=[first_connection, second_connection]
+                ),
+                fetch_size=10,
+                worker_count=2,
+            )
+            parquet_rows = pq.read_table(result.file_path).to_pylist()
+            self.assertEqual(result.row_count, 4)
+            self.assertEqual(result.worker_count, 2)
+            self.assertEqual(
+                [row["MSG_NO"] for row in parquet_rows],
+                ["1", "2", "3", "4"],
+            )
+            first_cursor.close.assert_called_once()
+            second_cursor.close.assert_called_once()
+
     def test_writes_all_fetch_chunks_to_one_parquet_file_with_raw_values(self):
         count_before = Mock()
         count_before.fetchone.return_value = (3,)

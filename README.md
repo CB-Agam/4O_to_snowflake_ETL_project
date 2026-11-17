@@ -55,9 +55,9 @@ batch size when needed:
 py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 ```
 
-## Extraction-only CSV export
+## Extraction-only Parquet export
 
-Extract one mapped table to a local CSV without running exception handling,
+Extract one mapped table to a local Parquet file without running exception handling,
 transformations, or any Snowflake upload. The worker count defaults to 3, and
 the code calculates the fetch size from the source row count (up to 100,000):
 
@@ -66,6 +66,9 @@ the code calculates the fetch size from the source row count (up to 100,000):
   --table "Account Contacts" `
   --export-dir exports
 ```
+
+Parquet is the default output. Use `--format csv` to explicitly request the
+previous CSV output.
 
 When the mapping has an integer-compatible primary-key column, extraction
 uses separate 4D connections and disjoint key ranges sized by approximate
@@ -80,12 +83,13 @@ This avoids unsupported row-number SQL but does not parallelize the 4D read
 for a table without a key.
 
 Both paths reconcile row counts and merge completed task files in order before
-publishing one UTF-8 CSV at
-`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.csv`. Only the final file is
-left for the later load step. The source table should remain stable during
-extraction. Concurrent 4D connections for primary-key parallel extraction
-remain driver/server dependent; use `--workers 1` until support is confirmed
-in a development environment. The command does not open a Snowflake
+publishing one file at
+`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.parquet`. Values are stored
+as mapped strings and SQL NULL is preserved as a Parquet null. Only the final
+file is left for the later load step. The source table should remain stable
+during extraction. Concurrent 4D connections for primary-key parallel
+extraction remain driver/server dependent; use `--workers 1` until support is
+confirmed in a development environment. The command does not open a Snowflake
 connection.
 
 ## Chunked file-based end-to-end ETL

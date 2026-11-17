@@ -36,7 +36,7 @@ The diagram is also available as an editable vector source:
 | Mapping workbook | `4D_to_Snowflake (1-50 tables mapping).xlsx` describes source tables and columns, target names and types, and mapping constraints. A selected target uses its matching worksheet; an all-table run uses the `Snowflake_table_names` worksheet. |
 | 4D source | `connections/fourd_connection.py` opens an ODBC connection. The runner issues a mapped `SELECT` query against the source table. |
 | Full-load extraction | `etl/load.py` uses `fetchmany()` batches, writes temporary JSON chunks, and bulk-loads them using Snowflake `PUT` and `COPY INTO`. The optional file-based runner streams to one Parquet or CSV file. |
-| Extraction-only CSV | `scripts/extract_table_to_csv.py` writes one final CSV. Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams counted chunks to a bounded CSV worker pool. This command does not connect to Snowflake. |
+| Extraction-only Parquet | `scripts/extract_table_to_csv.py` writes one final Parquet file by default (or CSV with `--format csv`). Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams counted chunks to a bounded worker pool. This command does not connect to Snowflake. |
 | Snowflake raw table | `connections/snowflake_connection.py` opens the Snowflake connection. The runner creates or prepares the mapped target table and inserts the rows. |
 | `ETL_PIPELINE_LOG` | `etl/audit.py` records pipeline and step audit events in the configured Snowflake database and schema. |
 | Incremental state and batch tables | `etl/incremental.py` creates `ETL_INCREMENTAL_TABLE_STATE`, `ETL_SOURCE_ROW_STATE`, and `ETL_INCREMENTAL_BATCH_LOG` when incremental mode is used. |
@@ -61,7 +61,7 @@ py -3.12 scripts\run_initial_etl.py --table CLAIMS --incremental --overlap-secon
 Incremental mode is opt-in. The overlap defaults to 86,400 seconds (24 hours)
 and can be set to a non-negative number of seconds.
 
-## Extraction-only CSV export
+## Extraction-only Parquet export
 
 The separate extraction command can be used without running validation,
 exception recovery, transformation, or Snowflake loading:
@@ -74,7 +74,8 @@ py -3.12 scripts\extract_table_to_csv.py `
 
 `--workers` accepts 1-3 (default 3). The fetch size is calculated from the
 source row count and worker count, capped at 100,000 rows; `--fetch-size` may
-still be supplied to override it. With a mapped integer-compatible primary-key
+still be supplied to override it. The output defaults to Parquet; pass
+`--format csv` to request CSV. With a mapped integer-compatible primary-key
 column, extraction uses separate 4D connections and disjoint key ranges sized
 using row-count quantiles. For a composite key, an integer-compatible mapped
 component may be used for range partitioning; rows sharing a component value
@@ -89,15 +90,15 @@ scheduled as workers finish. Because
 the server rejected `ROW_NUMBER()`/`ROWNUM` and paging syntax has not been
 confirmed, this path does not parallelize source reads or use `OFFSET`.
 If no mapped primary-key component is integer-compatible, the same counted,
-single-cursor task path is used. CSV headers, row widths, and source/extracted
-row counts are checked before completion. Keep the table stable during export
+single-cursor task path is used. Parquet schemas and source/extracted row
+counts are checked before completion. Keep the table stable during export
 because row-count reconciliation cannot detect every simultaneous source
 change.
 
 Both paths merge task files in order and leave one final file at
-`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.csv`. SQL NULL is represented
-by the export's reserved marker. The final file path and row count are printed
-for the subsequent loading stage.
+`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.parquet`. Values are stored
+as mapped strings and SQL NULL is preserved as a Parquet null. The final file
+path and row count are printed for the subsequent loading stage.
 
 ## Execution sequence
 
