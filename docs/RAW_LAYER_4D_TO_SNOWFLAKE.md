@@ -36,7 +36,7 @@ The diagram is also available as an editable vector source:
 | Mapping workbook | `4D_to_Snowflake (1-50 tables mapping).xlsx` describes source tables and columns, target names and types, and mapping constraints. A selected target uses its matching worksheet; an all-table run uses the `Snowflake_table_names` worksheet. |
 | 4D source | `connections/fourd_connection.py` opens an ODBC connection. The runner issues a mapped `SELECT` query against the source table. |
 | Full-load extraction | `etl/load.py` uses `fetchmany()` batches, writes temporary JSON chunks, and bulk-loads them using Snowflake `PUT` and `COPY INTO`. The optional file-based runner streams to one Parquet or CSV file. |
-| Extraction-only CSV | `scripts/extract_table_to_csv.py` writes one final CSV. Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams 10,000-row tasks to a bounded CSV worker pool. This command does not connect to Snowflake. |
+| Extraction-only CSV | `scripts/extract_table_to_csv.py` writes one final CSV. Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams counted chunks to a bounded CSV worker pool. This command does not connect to Snowflake. |
 | Snowflake raw table | `connections/snowflake_connection.py` opens the Snowflake connection. The runner creates or prepares the mapped target table and inserts the rows. |
 | `ETL_PIPELINE_LOG` | `etl/audit.py` records pipeline and step audit events in the configured Snowflake database and schema. |
 | Incremental state and batch tables | `etl/incremental.py` creates `ETL_INCREMENTAL_TABLE_STATE`, `ETL_SOURCE_ROW_STATE`, and `ETL_INCREMENTAL_BATCH_LOG` when incremental mode is used. |
@@ -69,23 +69,23 @@ exception recovery, transformation, or Snowflake loading:
 ```powershell
 py -3.12 scripts\extract_table_to_csv.py `
   --table ACCOUNT_CONTACTS `
-  --fetch-size 10000 `
-  --workers 2 `
   --export-dir exports
 ```
 
-`--fetch-size` defaults to 10,000 rows, and `--workers` accepts 1-3 (default
-3). With a mapped integer-compatible primary-key column, extraction uses
-separate 4D connections and disjoint numeric key ranges; each worker fetches
-in 10,000-row batches. For a composite key, an integer-compatible mapped
+`--workers` accepts 1-3 (default 3). The fetch size is calculated from the
+source row count and worker count, capped at 100,000 rows; `--fetch-size` may
+still be supplied to override it. With a mapped integer-compatible primary-key
+column, extraction uses separate 4D connections and disjoint key ranges sized
+using row-count quantiles. For a composite key, an integer-compatible mapped
 component may be used for range partitioning; rows sharing a component value
 stay in the same range. The 4D ODBC driver's concurrent connection behavior
 remains unverified, so begin with one worker and use multiple workers only
 after confirming support against a development database.
 
 If no primary key is mapped, the exporter counts the table and reads through
-one 4D cursor in 10,000-row tasks. Up to three workers process these extracted
-tasks concurrently, and more tasks are scheduled as workers finish. Because
+one 4D cursor in dynamically sized chunks (at most 100,000 rows). Up to three
+workers process these extracted tasks concurrently, and more tasks are
+scheduled as workers finish. Because
 the server rejected `ROW_NUMBER()`/`ROWNUM` and paging syntax has not been
 confirmed, this path does not parallelize source reads or use `OFFSET`.
 If no mapped primary-key component is integer-compatible, the same counted,

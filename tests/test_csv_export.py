@@ -9,6 +9,7 @@ from unittest.mock import Mock
 from etl.csv_export import (
     CSV_NULL_MARKER,
     _primary_key_source_column,
+    _resolve_fetch_size,
     export_table_to_csv,
     export_table_to_csv_parallel,
 )
@@ -140,12 +141,28 @@ class CsvExportTests(unittest.TestCase):
         mapping[1]["constraint"] = "PK (composite, 2 of 2)"
         self.assertEqual(_primary_key_source_column(mapping), "Msg_No")
 
+    def test_fetch_size_is_derived_from_count_and_worker_count_when_omitted(self):
+        self.assertEqual(_resolve_fetch_size(50_000, 3, None), 16_667)
+        self.assertEqual(_resolve_fetch_size(12_000, 3, None), 4_000)
+        self.assertEqual(_resolve_fetch_size(2, 3, None), 1)
+        self.assertEqual(_resolve_fetch_size(4_306_127, 3, None), 100_000)
+        self.assertEqual(_resolve_fetch_size(150_000, 3, None), 50_000)
+        self.assertEqual(_resolve_fetch_size(50_000, 3, 5_000), 5_000)
+
     def test_parallel_export_uses_separate_connections_and_streams_each_range(self):
         mapping = [dict(row) for row in MAPPING]
         mapping[0]["constraint"] = "PK"
 
         bounds_cursor = Mock()
-        bounds_cursor.fetchone.side_effect = [(4,), (1,), (4,), (2,), (2,)]
+        bounds_cursor.fetchone.side_effect = [
+            (4,),
+            (1,),
+            (4,),
+            (2,),
+            (3,),
+            (2,),
+            (2,),
+        ]
         final_count_cursor = Mock()
         final_count_cursor.fetchone.return_value = (4,)
         source_connection = Mock()
@@ -198,6 +215,8 @@ class CsvExportTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM [Messages]",
                     "SELECT MIN([Msg_No]) FROM [Messages]",
                     "SELECT MAX([Msg_No]) FROM [Messages]",
+                    "SELECT COUNT(*) FROM [Messages] WHERE [Msg_No] <= 2",
+                    "SELECT COUNT(*) FROM [Messages] WHERE [Msg_No] <= 3",
                     "SELECT COUNT(*) FROM [Messages] WHERE [Msg_No] >= 1 AND [Msg_No] < 3",
                     "SELECT COUNT(*) FROM [Messages] WHERE [Msg_No] >= 3",
                 ],
@@ -286,7 +305,14 @@ class CsvExportTests(unittest.TestCase):
         mapping[0]["constraint"] = "PK"
 
         bounds_cursor = Mock()
-        bounds_cursor.fetchone.side_effect = [(2,), (1,), (2,), (1,), (1,)]
+        bounds_cursor.fetchone.side_effect = [
+            (2,),
+            (1,),
+            (2,),
+            (1,),
+            (1,),
+            (1,),
+        ]
         source_connection = Mock()
         source_connection.cursor.return_value = bounds_cursor
 

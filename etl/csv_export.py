@@ -27,6 +27,7 @@ from etl.source_extract import (
 
 logger = logging.getLogger(__name__)
 CSV_NULL_MARKER = "__ETL_CSV_NULL_9C487D4E__"
+MAX_AUTO_FETCH_SIZE = 100_000
 
 
 @dataclass(frozen=True)
@@ -84,12 +85,26 @@ class _KeyRange:
     expected_rows: int
 
 
+def _resolve_fetch_size(
+    source_row_count: int,
+    worker_count: int,
+    requested_fetch_size: int | None,
+) -> int:
+    if requested_fetch_size is not None:
+        if requested_fetch_size <= 0:
+            raise ValueError("Fetch size must be greater than zero")
+        return requested_fetch_size
+    active_workers = min(worker_count, max(1, source_row_count))
+    rows_per_worker = math.ceil(source_row_count / active_workers)
+    return max(1, min(MAX_AUTO_FETCH_SIZE, rows_per_worker))
+
+
 def _export_without_primary_key(
     source_connection: Any,
     mapping_rows: Sequence[dict[str, str]],
     export_root: str | Path,
     run_id: str,
-    fetch_size: int,
+    requested_fetch_size: int | None,
     worker_count: int,
     started_at: float,
 ) -> ParallelCsvExportResult:
@@ -106,6 +121,11 @@ def _export_without_primary_key(
     run_directory.mkdir(parents=True, exist_ok=True)
 
     source_count_before = count_source_rows(source_connection, source_table)
+    fetch_size = _resolve_fetch_size(
+        source_count_before,
+        worker_count,
+        requested_fetch_size,
+    )
     final_path = run_directory / f"{table_component.lower()}.csv"
     if final_path.exists():
         raise FileExistsError(
@@ -391,17 +411,40 @@ def _query_key_ranges(
                 f"{minimum}..{maximum}"
             )
 
+        boundaries: list[int] = []
+        for worker_index in range(1, min(worker_count, source_count)):
+            target_rows_before_boundary = (
+                source_count * worker_index // min(worker_count, source_count)
+            ) + 1
+            lower = minimum
+            upper = maximum
+            while lower < upper:
+                midpoint = (lower + upper) // 2
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM {table_sql} "
+                    f"WHERE {key_sql} <= {midpoint}"
+                )
+                midpoint_result = cursor.fetchone()
+                if not midpoint_result or midpoint_result[0] is None:
+                    raise RuntimeError(
+                        f"4D did not return a key-distribution count for "
+                        f"{source_table} at {midpoint}"
+                    )
+                if int(midpoint_result[0]) < target_rows_before_boundary:
+                    lower = midpoint + 1
+                else:
+                    upper = midpoint
+            if lower > minimum and (
+                not boundaries or lower > boundaries[-1]
+            ):
+                boundaries.append(lower)
+
         ranges: list[tuple[int, int | None]] = []
-        key_span = maximum - minimum + 1
-        effective_workers = min(worker_count, key_span)
-        for index in range(effective_workers):
-            lower = minimum + (key_span * index // effective_workers)
-            upper = (
-                minimum + (key_span * (index + 1) // effective_workers)
-                if index + 1 < effective_workers
-                else None
-            )
-            ranges.append((lower, upper))
+        range_lower = minimum
+        for boundary in boundaries:
+            ranges.append((range_lower, boundary))
+            range_lower = boundary
+        ranges.append((range_lower, None))
 
         expected_counts: list[_KeyRange] = []
         for lower, upper in ranges:
@@ -434,11 +477,9 @@ def export_table_to_csv_parallel(
     export_root: str | Path,
     run_id: str,
     connection_factory: Any,
-    fetch_size: int = 10_000,
-    worker_count: int = 2,
+    fetch_size: int | None = None,
+    worker_count: int = 3,
 ) -> ParallelCsvExportResult:
-    if fetch_size <= 0:
-        raise ValueError("Fetch size must be greater than zero")
     if not 1 <= worker_count <= 3:
         raise ValueError("Worker count must be between 1 and 3")
 
@@ -472,6 +513,11 @@ def export_table_to_csv_parallel(
         source_table,
         primary_key,
         worker_count,
+    )
+    resolved_fetch_size = _resolve_fetch_size(
+        source_count_before,
+        worker_count,
+        fetch_size,
     )
     final_path = run_directory / f"{table_component.lower()}.csv"
     if final_path.exists():
@@ -529,7 +575,7 @@ def export_table_to_csv_parallel(
                 writer.writerow(target_columns)
                 while True:
                     fetch_started = perf_counter()
-                    batch = cursor.fetchmany(fetch_size)
+                    batch = cursor.fetchmany(resolved_fetch_size)
                     fetch_seconds += perf_counter() - fetch_started
                     if not batch:
                         break
@@ -662,7 +708,7 @@ def export_table_to_csv_parallel(
         row_count=sum(result.row_count for result in worker_results),
         file_size_bytes=final_path.stat().st_size,
         worker_count=len(key_ranges),
-        fetch_size=fetch_size,
+        fetch_size=resolved_fetch_size,
         source_count_before=source_count_before,
         source_count_after=source_count_after,
         query_seconds=sum(result.query_seconds for result in worker_results),

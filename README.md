@@ -58,27 +58,26 @@ py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 ## Extraction-only CSV export
 
 Extract one mapped table to a local CSV without running exception handling,
-transformations, or any Snowflake upload. The default fetch/task size is 10,000
-rows and the default worker count is 3:
+transformations, or any Snowflake upload. The worker count defaults to 3, and
+the code calculates the fetch size from the source row count (up to 100,000):
 
 ```powershell
 .\env_etl\Scripts\python.exe scripts\extract_table_to_csv.py `
   --table "Account Contacts" `
-  --fetch-size 10000 `
-  --workers 2 `
   --export-dir exports
 ```
 
 When the mapping has an integer-compatible primary-key column, extraction
-uses separate 4D connections and disjoint half-open key ranges. For a
-composite key, an integer-compatible mapped component can be used to divide
-the ranges; duplicate component values remain together in the same range.
-Each worker fetches its range in 10,000-row ODBC batches. When no primary key
-is mapped (or no mapped key component is integer-compatible),
-the source is read through one 4D cursor in 10,000-row tasks; up to three
-worker threads process those tasks, and later tasks are scheduled as workers
-finish. This avoids unsupported row-number SQL but does not parallelize the 4D
-read for a table without a key.
+uses separate 4D connections and disjoint key ranges sized by approximate
+row-count quantiles, rather than equal numeric key spans. For a composite key,
+an integer-compatible mapped component can be used to divide the ranges;
+duplicate component values remain together in the same range. When no primary
+key is mapped (or no mapped key component is integer-compatible),
+the source is read through one 4D cursor in chunks calculated from the source
+count and worker count (never larger than 100,000 rows); up to three worker
+threads process those chunks, and later tasks are scheduled as workers finish.
+This avoids unsupported row-number SQL but does not parallelize the 4D read
+for a table without a key.
 
 Both paths reconcile row counts and merge completed task files in order before
 publishing one UTF-8 CSV at

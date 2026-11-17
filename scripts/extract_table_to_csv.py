@@ -79,8 +79,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fetch-size",
         type=_positive_int,
-        default=10_000,
-        help="Rows per worker ODBC fetch (default: 10000)",
+        default=None,
+        help=(
+            "Rows per ODBC fetch; defaults to a table-count-based value "
+            "(maximum 100000)"
+        ),
     )
     parser.add_argument(
         "--workers",
