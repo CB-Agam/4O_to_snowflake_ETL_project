@@ -135,6 +135,11 @@ come from 4D. Values are stored as strings and SQL NULL as a Parquet null.
 Binary values use a `base64:`-prefixed representation. Only the final file is
 left for the later load step. The source table should remain stable during
 extraction. The Snowflake connection is used only for audit logging.
+If 4D returns no result or NULL for `COUNT(*)`, the extractor skips the table
+without a fallback scan and records `SKIPPED` in `ETL_PIPELINE_LOG` with
+`row_count` set to JSON `null` (unknown, not zero). No file is published for
+that table. A missing count during final reconciliation also discards the
+incomplete export.
 
 ## Chunked file-based end-to-end ETL
 

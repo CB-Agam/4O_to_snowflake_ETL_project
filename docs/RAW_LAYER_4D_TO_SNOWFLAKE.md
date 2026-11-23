@@ -100,6 +100,9 @@ scheduled as workers finish. Because
 the server rejected `ROW_NUMBER()`/`ROWNUM` and paging syntax has not been
 confirmed, this path does not parallelize source reads or use `OFFSET`.
 Parquet schemas and source/extracted row counts are checked before completion.
+If `COUNT(*)` returns no row or NULL, the extraction command skips the table
+and records `SKIPPED` with unknown row count in `ETL_PIPELINE_LOG`. It does
+not publish a file or scan the table to infer a count.
 Keep the table stable during export
 because row-count reconciliation cannot detect every simultaneous source
 change.

@@ -59,6 +59,10 @@ def build_full_table_query(mapping_rows: Sequence[dict[str, str]]) -> str:
     )
 
 
+class SourceRowCountUnavailable(RuntimeError):
+    pass
+
+
 def count_source_rows(source_connection: Any, source_table: str) -> int:
     table_name = source_table.strip()
     if not table_name or "\x00" in table_name:
@@ -68,14 +72,17 @@ def count_source_rows(source_connection: Any, source_table: str) -> int:
     try:
         cursor.execute(f"SELECT COUNT(*) FROM {quoted_table}")
         result = cursor.fetchone()
-        if not result or result[0] is None:
-            raise RuntimeError(f"4D did not return a row count for {source_table}")
-        count = int(result[0])
-        if count < 0:
-            raise RuntimeError(f"4D returned an invalid row count for {source_table}: {count}")
-        return count
     finally:
         cursor.close()
+
+    if not result or result[0] is None:
+        raise SourceRowCountUnavailable(
+            f"4D did not return a row count for {source_table}"
+        )
+    count = int(result[0])
+    if count < 0:
+        raise RuntimeError(f"4D returned an invalid row count for {source_table}: {count}")
+    return count
 
 
 def stream_source_batches(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 import pyarrow.parquet as pq
 
 from etl.parallel_parquet_export import export_table_to_parquet_parallel
+from etl.csv_export import export_table_to_csv_parallel
 from etl.source_extract import build_full_table_query
 from scripts import extract_table_to_csv as extract_cli
 
@@ -186,6 +188,74 @@ class ExtractTableCliTests(unittest.TestCase):
         finish = self.audit.finish_step.call_args
         self.assertEqual(finish.args[:2], (1, "FAILED"))
         self.assertIn("source read failed", finish.kwargs["error_message"])
+
+    def test_missing_count_skips_table_and_continues_without_scanning(self):
+        for output_format in ("parquet", "csv"):
+            with self.subTest(output_format=output_format):
+                self.audit.reset_mock()
+                table_cursor, columns_cursor = Mock(), Mock()
+                table_cursor.tables.return_value = [
+                    SimpleNamespace(table_name="Messages"),
+                    SimpleNamespace(table_name="Alerts"),
+                ]
+                columns_cursor.columns.side_effect = [
+                    [_column("Messages", "Msg_No", "INTEGER")],
+                    [_column("Alerts", "Alert ID", "INTEGER")],
+                ]
+                missing_count, valid_count, source, after_count = (
+                    Mock(), Mock(), Mock(), Mock()
+                )
+                missing_count.fetchone.return_value = None
+                valid_count.fetchone.return_value = (1,)
+                source.fetchmany.side_effect = [[(7,)], []]
+                after_count.fetchone.return_value = (1,)
+                self.connection.cursor.side_effect = [
+                    table_cursor, columns_cursor, columns_cursor,
+                    missing_count, valid_count, source, after_count,
+                ]
+                if output_format == "parquet":
+                    self.export_parquet.side_effect = export_table_to_parquet_parallel
+                else:
+                    self.export_csv.side_effect = export_table_to_csv_parallel
+                with tempfile.TemporaryDirectory() as directory:
+                    result = extract_cli.main([
+                        "--table", "all", "--format", output_format,
+                        "--export-dir", directory, "--workers", "1",
+                    ])
+                    self.assertEqual(result, 0)
+                    self.assertEqual(
+                        list((Path(directory) / "MESSAGES").rglob(f"*.{output_format}")), []
+                    )
+                    self.assertEqual(
+                        len(list((Path(directory) / "ALERTS").rglob(f"*.{output_format}"))), 1
+                    )
+                self.assertEqual(missing_count.execute.call_count, 1)
+                missing_count.fetchmany.assert_not_called()
+                skipped = self.audit.finish_step.call_args_list[0]
+                self.assertEqual(skipped.args[:2], (1, "SKIPPED"))
+                self.assertEqual(json.loads(skipped.args[2])["reason"],
+                                 "SOURCE_ROW_COUNT_UNAVAILABLE")
+                self.assertIsNone(json.loads(skipped.args[2])["row_count"])
+                self.assertEqual(self.audit.finish_step.call_args_list[1].args[:2], (1, "SUCCESS"))
+
+    def test_missing_final_count_skips_and_removes_partial_output(self):
+        table_cursor, columns_cursor = Mock(), Mock()
+        table_cursor.tables.return_value = [SimpleNamespace(table_name="Messages")]
+        columns_cursor.columns.return_value = [_column("Messages", "Msg_No", "INTEGER")]
+        before, source, after = Mock(), Mock(), Mock()
+        before.fetchone.return_value = (1,)
+        source.fetchmany.side_effect = [[(1,)], []]
+        after.fetchone.return_value = (None,)
+        self.connection.cursor.side_effect = [table_cursor, columns_cursor, before, source, after]
+        self.export_parquet.side_effect = export_table_to_parquet_parallel
+        with tempfile.TemporaryDirectory() as directory:
+            result = extract_cli.main([
+                "--table", "Messages", "--export-dir", directory, "--workers", "1",
+            ])
+            self.assertEqual(result, 0)
+            self.assertEqual(list(Path(directory).rglob("*.parquet")), [])
+            self.assertEqual(list(Path(directory).rglob("*.partial")), [])
+        self.assertEqual(self.audit.finish_step.call_args.args[:2], (1, "SKIPPED"))
 
     def test_snowflake_connection_failure_prevents_extraction(self):
         self.snowflake.side_effect = RuntimeError("Snowflake unavailable")

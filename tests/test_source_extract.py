@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock
 
 from etl.source_extract import (
+    SourceRowCountUnavailable,
     build_full_table_query,
     count_source_rows,
     stream_source_batches,
@@ -145,6 +146,19 @@ class SourceExtractionTests(unittest.TestCase):
         cursor.execute.assert_called_once_with("SELECT COUNT(*) FROM [Claims Trans]")
         cursor.fetchone.assert_called_once()
         cursor.close.assert_called_once()
+
+    def test_missing_count_is_reported_without_scanning(self):
+        for missing_result in (None, (None,)):
+            with self.subTest(missing_result=missing_result):
+                cursor = Mock()
+                cursor.fetchone.return_value = missing_result
+                connection = Mock()
+                connection.cursor.return_value = cursor
+                with self.assertRaisesRegex(SourceRowCountUnavailable, "did not return a row count"):
+                    count_source_rows(connection, "Account Reward Points")
+                connection.cursor.assert_called_once()
+                cursor.fetchmany.assert_not_called()
+                cursor.close.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ from etl.audit import SnowflakeAuditLogger
 from etl.csv_export import export_table_to_csv_parallel
 from etl.parallel_parquet_export import export_table_to_parquet_parallel
 from etl.parquet_export import _safe_path_component
+from etl.source_extract import SourceRowCountUnavailable
 
 DEFAULT_EXPORT_DIR = PROJECT_ROOT / "exports"
 logger = logging.getLogger(__name__)
@@ -322,6 +323,16 @@ def main(argv: list[str] | None = None) -> int:
                         ";".join(str(path) for path in result.file_paths),
                     )
                     output_paths = result.file_paths
+            except SourceRowCountUnavailable as exc:
+                details = {
+                    "reason": "SOURCE_ROW_COUNT_UNAVAILABLE",
+                    "row_count": None,
+                    "message": str(exc),
+                }
+                logger.warning("Skipping %s: %s; row count unknown", table_name, exc)
+                audit.finish_step(table_step, "SKIPPED", json.dumps(details, sort_keys=True))
+                print(f"Skipping {table_name}: {exc}; row count unknown")
+                continue
             except Exception as exc:
                 logger.exception("4D extraction failed for %s", table_name)
                 print(f"Extraction failed for {table_name}: {exc}")
