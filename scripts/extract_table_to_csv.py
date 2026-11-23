@@ -44,14 +44,21 @@ def _worker_count(value: str) -> int:
     return count
 
 
-def _find_mapping_sheet(excel_path: Path, table_name: str) -> str:
+def _matching_mapping_sheets(
+    sheet_names: list[str],
+    table_name: str,
+) -> list[str]:
     expected = _normalize_name(table_name)
+    return [
+        sheet
+        for sheet in sheet_names
+        if _normalize_name(sheet) == expected
+    ]
+
+
+def _find_mapping_sheet(excel_path: Path, table_name: str) -> str:
     with pd.ExcelFile(excel_path) as workbook:
-        matches = [
-            sheet
-            for sheet in workbook.sheet_names
-            if _normalize_name(sheet) == expected
-        ]
+        matches = _matching_mapping_sheets(workbook.sheet_names, table_name)
     if len(matches) != 1:
         raise ValueError(
             f"Expected one mapping worksheet matching {table_name!r}; found {matches}"
@@ -59,15 +66,60 @@ def _find_mapping_sheet(excel_path: Path, table_name: str) -> str:
     return matches[0]
 
 
+def _load_all_table_names(excel_path: Path) -> list[str]:
+    table_index = pd.read_excel(excel_path, sheet_name="Snowflake_table_names")
+    if table_index.empty or len(table_index.columns) == 0:
+        raise ValueError("The Snowflake_table_names worksheet contains no tables")
+
+    table_names = []
+    seen_names = set()
+    for value in table_index.iloc[:, 0]:
+        if pd.isna(value):
+            continue
+        table_name = str(value).strip()
+        normalized_name = _normalize_name(table_name)
+        if normalized_name and normalized_name not in seen_names:
+            table_names.append(table_name)
+            seen_names.add(normalized_name)
+    if not table_names:
+        raise ValueError("The Snowflake_table_names worksheet contains no tables")
+    return table_names
+
+
+def _mapped_target_table(mapping_rows: list[dict[str, str]]) -> str:
+    return next(
+        row["target_table"].strip()
+        for row in mapping_rows
+        if row.get("source_table", "").strip()
+        and row.get("source_column", "").strip()
+        and row.get("target_table", "").strip()
+        and row.get("target_column", "").strip()
+    )
+
+
+def _has_parquet_export(export_dir: Path, target_table: str) -> Path | None:
+    table_dir = export_dir / _normalize_name(target_table)
+    if not table_dir.is_dir():
+        return None
+    return next(
+        (path for path in table_dir.rglob("*.parquet") if path.is_file()),
+        None,
+    )
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract one mapped 4D table to one final local Parquet file "
+            "Extract mapped 4D tables to final local Parquet files "
             "(or CSV with --format csv). "
             "This command does not connect to or write to Snowflake."
         )
     )
-    parser.add_argument("--table", required=True, help="Mapped source/target table name")
+    parser.add_argument(
+        "--table",
+        required=True,
+        help="Mapped source/target table name, or 'all' for every indexed table",
+    )
     parser.add_argument(
         "--excel",
         type=Path,
@@ -122,79 +174,153 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.excel.is_file():
             raise FileNotFoundError(f"Mapping workbook not found: {args.excel}")
-        sheet_name = args.sheet or _find_mapping_sheet(args.excel, args.table)
-        metadata = load_metadata_from_excel(str(args.excel), sheet_name=sheet_name)
-        mapping_rows = metadata.get(_normalize_name(args.table))
-        if not mapping_rows:
-            raise ValueError(
-                f"No source-to-target mapping found for {args.table!r} "
-                f"in worksheet {sheet_name!r}"
-            )
+        all_tables = _normalize_name(args.table) == "ALL"
+        if all_tables and args.sheet:
+            raise ValueError("--sheet cannot be used with --table all")
 
+        selected_tables = []
+        table_names = (
+            _load_all_table_names(args.excel) if all_tables else [args.table]
+        )
+        mapping_sheets = None
+        if all_tables:
+            with pd.ExcelFile(args.excel) as workbook:
+                mapping_sheets = workbook.sheet_names
+        for table_name in table_names:
+            try:
+                if all_tables:
+                    matches = _matching_mapping_sheets(
+                        mapping_sheets or [],
+                        table_name,
+                    )
+                    if not matches:
+                        message = (
+                            f"Skipping {table_name}: no matching mapping worksheet"
+                        )
+                        logger.warning(message)
+                        print(message)
+                        continue
+                    if len(matches) != 1:
+                        raise ValueError(
+                            f"Expected one mapping worksheet matching "
+                            f"{table_name!r}; found {matches}"
+                        )
+                    sheet_name = matches[0]
+                else:
+                    sheet_name = args.sheet or _find_mapping_sheet(
+                        args.excel, table_name
+                    )
+                metadata = load_metadata_from_excel(
+                    str(args.excel),
+                    sheet_name=sheet_name,
+                )
+                mapping_rows = metadata.get(_normalize_name(table_name))
+                if not mapping_rows:
+                    if all_tables:
+                        message = (
+                            f"Skipping {table_name}: no source-to-target "
+                            f"mapping in worksheet {sheet_name!r}"
+                        )
+                        logger.warning(message)
+                        print(message)
+                        continue
+                    raise ValueError(
+                        f"No source-to-target mapping found for {table_name!r} "
+                        f"in worksheet {sheet_name!r}"
+                    )
+
+                if all_tables and args.output_format == "parquet":
+                    target_table = _mapped_target_table(mapping_rows)
+                    existing_file = _has_parquet_export(
+                        args.export_dir,
+                        target_table,
+                    )
+                    if existing_file is not None:
+                        message = (
+                            f"Skipping {table_name}: Parquet already exists at "
+                            f"{existing_file}"
+                        )
+                        logger.info(message)
+                        print(message)
+                        continue
+                selected_tables.append((table_name, mapping_rows))
+            except Exception as exc:
+                logger.exception("Could not prepare extraction for %s", table_name)
+                print(f"Extraction failed for {table_name}: {exc}")
+                exit_code = 1
+
+        if not selected_tables:
+            return exit_code
         source_connection = connect_to_4d()
         run_id = args.run_id or str(uuid4())
-        if args.output_format == "parquet":
-            result = export_table_to_parquet_parallel(
-                source_connection,
-                mapping_rows,
-                args.export_dir,
-                run_id,
-                connection_factory=connect_to_4d,
-                fetch_size=args.fetch_size,
-                worker_count=args.workers,
-            )
-            logger.info(
-                "4D Parquet extraction completed: table=%s rows=%s workers=%s "
-                "fetch_size=%s query_seconds=%.3f fetch_seconds=%.3f "
-                "serialization_seconds=%.3f parquet_write_seconds=%.3f "
-                "total_seconds=%.3f file=%s",
-                result.target_table,
-                result.row_count,
-                result.worker_count,
-                result.fetch_size,
-                result.query_seconds,
-                result.fetch_seconds,
-                result.serialization_seconds,
-                result.parquet_write_seconds,
-                result.total_seconds,
-                result.file_path,
-            )
-            output_paths = (result.file_path,)
-        else:
-            result = export_table_to_csv_parallel(
-                source_connection,
-                mapping_rows,
-                args.export_dir,
-                run_id,
-                connection_factory=connect_to_4d,
-                fetch_size=args.fetch_size,
-                worker_count=args.workers,
-            )
-            logger.info(
-                "4D CSV extraction completed: table=%s rows=%s workers=%s "
-                "fetch_size=%s query_seconds=%.3f fetch_seconds=%.3f "
-                "serialization_seconds=%.3f csv_write_seconds=%.3f "
-                "total_seconds=%.3f files=%s",
-                result.target_table,
-                result.row_count,
-                result.worker_count,
-                result.fetch_size,
-                result.query_seconds,
-                result.fetch_seconds,
-                result.serialization_seconds,
-                result.csv_write_seconds,
-                result.total_seconds,
-                ";".join(str(path) for path in result.file_paths),
-            )
-            output_paths = result.file_paths
-        print(
-            f"Extraction completed: format={args.output_format} "
-            f"table={result.target_table} rows={result.row_count} "
-            f"workers={result.worker_count} fetch_size={result.fetch_size} "
-            f"files={len(output_paths)}"
-        )
-        for path in output_paths:
-            print(path)
+        for table_name, mapping_rows in selected_tables:
+            try:
+                if args.output_format == "parquet":
+                    result = export_table_to_parquet_parallel(
+                        source_connection,
+                        mapping_rows,
+                        args.export_dir,
+                        run_id,
+                        connection_factory=connect_to_4d,
+                        fetch_size=args.fetch_size,
+                        worker_count=args.workers,
+                    )
+                    logger.info(
+                        "4D Parquet extraction completed: table=%s rows=%s "
+                        "workers=%s fetch_size=%s query_seconds=%.3f "
+                        "fetch_seconds=%.3f serialization_seconds=%.3f "
+                        "parquet_write_seconds=%.3f total_seconds=%.3f file=%s",
+                        result.target_table,
+                        result.row_count,
+                        result.worker_count,
+                        result.fetch_size,
+                        result.query_seconds,
+                        result.fetch_seconds,
+                        result.serialization_seconds,
+                        result.parquet_write_seconds,
+                        result.total_seconds,
+                        result.file_path,
+                    )
+                    output_paths = (result.file_path,)
+                else:
+                    result = export_table_to_csv_parallel(
+                        source_connection,
+                        mapping_rows,
+                        args.export_dir,
+                        run_id,
+                        connection_factory=connect_to_4d,
+                        fetch_size=args.fetch_size,
+                        worker_count=args.workers,
+                    )
+                    logger.info(
+                        "4D CSV extraction completed: table=%s rows=%s "
+                        "workers=%s fetch_size=%s query_seconds=%.3f "
+                        "fetch_seconds=%.3f serialization_seconds=%.3f "
+                        "csv_write_seconds=%.3f total_seconds=%.3f files=%s",
+                        result.target_table,
+                        result.row_count,
+                        result.worker_count,
+                        result.fetch_size,
+                        result.query_seconds,
+                        result.fetch_seconds,
+                        result.serialization_seconds,
+                        result.csv_write_seconds,
+                        result.total_seconds,
+                        ";".join(str(path) for path in result.file_paths),
+                    )
+                    output_paths = result.file_paths
+                print(
+                    f"Extraction completed: format={args.output_format} "
+                    f"table={result.target_table} rows={result.row_count} "
+                    f"workers={result.worker_count} "
+                    f"fetch_size={result.fetch_size} files={len(output_paths)}"
+                )
+                for path in output_paths:
+                    print(path)
+            except Exception as exc:
+                logger.exception("4D extraction failed for %s", table_name)
+                print(f"Extraction failed for {table_name}: {exc}")
+                exit_code = 1
     except Exception:
         logger.exception("4D extraction failed for %s", args.table)
         exit_code = 1

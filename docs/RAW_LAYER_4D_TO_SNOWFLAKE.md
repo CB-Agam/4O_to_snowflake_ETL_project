@@ -72,6 +72,18 @@ py -3.12 scripts\extract_table_to_csv.py `
   --export-dir exports
 ```
 
+Pass `--table all` to extract all indexed names that have mapping worksheets
+and mapping rows. Unmapped names are reported and skipped. In Parquet mode,
+tables with an existing Parquet file under `exports\<TARGET_TABLE>` are also
+skipped:
+
+```powershell
+py -3.12 scripts\extract_table_to_csv.py `
+  --table all `
+  --export-dir exports `
+  --format parquet
+```
+
 `--workers` accepts 1-3 (default 3). The fetch size is calculated from the
 source row count and worker count, capped at 100,000 rows; `--fetch-size` may
 still be supplied to override it. The output defaults to Parquet; pass

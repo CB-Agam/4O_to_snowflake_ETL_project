@@ -57,14 +57,27 @@ py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 
 ## Extraction-only Parquet export
 
-Extract one mapped table to a local Parquet file without running exception handling,
-transformations, or any Snowflake upload. The worker count defaults to 3, and
-the code calculates the fetch size from the source row count (up to 100,000):
+Extract one mapped table, or every indexed table with a mapping worksheet, to
+local files without running exception handling, transformations, or any
+Snowflake upload. The worker count defaults to 3, and the code calculates the
+fetch size from the source row count (up to 100,000):
 
 ```powershell
 .\env_etl\Scripts\python.exe scripts\extract_table_to_csv.py `
   --table "Account Contacts" `
   --export-dir exports
+```
+
+For all indexed tables, use `--table all`. Entries without a mapping worksheet
+or mapping rows are reported and skipped. In Parquet mode, a table is also
+skipped when a Parquet file already exists under its
+`exports\<TARGET_TABLE>` folder:
+
+```powershell
+.\env_etl\Scripts\python.exe scripts\extract_table_to_csv.py `
+  --table all `
+  --export-dir exports `
+  --format parquet
 ```
 
 Parquet is the default output. Use `--format csv` to explicitly request the
