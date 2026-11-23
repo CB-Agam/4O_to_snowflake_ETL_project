@@ -58,9 +58,10 @@ py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 ## Extraction-only Parquet export
 
 Extract one mapped table, or every indexed table with a mapping worksheet, to
-local files without running exception handling, transformations, or any
-Snowflake upload. The worker count defaults to 3, and the code calculates the
-fetch size from the source row count (up to 100,000):
+local files without transformations or uploading extracted data to Snowflake.
+The command requires Snowflake for audit logging. The worker count defaults to
+3, and the code calculates the fetch size from the source row count (up to
+100,000):
 
 ```powershell
 .\env_etl\Scripts\python.exe scripts\extract_table_to_csv.py `
@@ -83,6 +84,45 @@ skipped when a Parquet file already exists under its
 Parquet is the default output. Use `--format csv` to explicitly request the
 previous CSV output.
 
+The command records each table in Snowflake's `ETL_PIPELINE_LOG` as
+`PARQUET_EXTRACTION` (or `CSV_EXTRACTION`), with running, success, failure, or
+skipped status. Successful records include the row count, file paths, timings,
+and export run ID. The audit uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA`
+from `.env`, or `--database` and `--schema` overrides. Snowflake logging is
+required: a connection or audit-write failure makes the command fail. A
+completed export file may already exist if its final audit write fails.
+Local console and file logging remains enabled.
+
+### Upload existing Parquet files without the workbook
+
+The separate uploader reads every Parquet file under `exports`, derives its
+table name from the file's `target_table` metadata, and creates
+`<TARGET_TABLE>` using the Parquet column names as VARCHAR columns:
+
+```powershell
+.\env_etl\Scripts\python.exe scripts\upload_parquet_exports.py `
+  --export-dir exports `
+  --archive-dir uploaded_exports
+```
+
+The command uses `SNOWFLAKE_DATABASE` and `SNOWFLAKE_SCHEMA` from `.env`,
+unless `--database` and `--schema` are supplied. It replaces each existing
+target table with the file's complete snapshot after staging and checking the row
+count. It does not transform or quarantine values. Files are processed by
+modification time, oldest first; when several files belong to one table, its
+newest snapshot is left in Snowflake. Successfully uploaded files are moved
+to the archive, keeping their relative paths. A failed upload remains in
+`exports` and blocks newer files for that table. Existing archive files are
+never overwritten.
+
+**Important:** Replacement removes the prior target-table data and schema;
+grants are copied, but other table properties and policies are not preserved.
+This can replace a typed target created by another ETL workflow with VARCHAR
+columns. Use the intended development database/schema. Already-exported Parquet files
+contain only the columns extracted originally; this uploader cannot recover
+columns that are absent from them. It accepts text-column Parquet exports
+with `target_table` metadata, not arbitrary Parquet files.
+
 When the mapping has an integer-compatible primary-key column, extraction
 uses separate 4D connections and disjoint key ranges sized by approximate
 row-count quantiles, rather than equal numeric key spans. For a composite key,
@@ -102,8 +142,8 @@ as mapped strings and SQL NULL is preserved as a Parquet null. Only the final
 file is left for the later load step. The source table should remain stable
 during extraction. Concurrent 4D connections for primary-key parallel
 extraction remain driver/server dependent; use `--workers 1` until support is
-confirmed in a development environment. The command does not open a Snowflake
-connection.
+confirmed in a development environment. The Snowflake connection is used only
+for audit logging, not for uploading extracted data.
 
 ## Chunked file-based end-to-end ETL
 

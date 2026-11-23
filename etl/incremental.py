@@ -685,10 +685,22 @@ def acquire_table_run_lock(
     schema: str,
     table_name: str,
     metadata_rows: Sequence[dict[str, str]],
+    reuse_existing_strategy: bool = False,
 ) -> dict[str, str]:
     state_table = _ensure_state_table(cursor, database, schema)
     owner = str(uuid4())
     strategy = select_change_strategy(metadata_rows)["strategy"]
+    if reuse_existing_strategy:
+        rows = cursor.execute(
+            f"SELECT STRATEGY FROM {state_table} WHERE TABLE_NAME = %s",
+            (table_name,),
+        ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError(f"Incremental state has duplicate rows for {table_name}")
+        if rows:
+            strategy = str(rows[0][0])
+            if strategy not in {"KEY_TIMESTAMP", "ROW_HASH"}:
+                raise RuntimeError(f"Invalid lock strategy for {table_name}: {strategy!r}")
     _acquire_lock(cursor, connection, state_table, table_name, strategy, owner)
     return {"state_table": state_table, "owner": owner, "strategy": strategy}
 

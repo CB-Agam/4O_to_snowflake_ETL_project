@@ -36,7 +36,7 @@ The diagram is also available as an editable vector source:
 | Mapping workbook | `4D_to_Snowflake (1-50 tables mapping).xlsx` describes source tables and columns, target names and types, and mapping constraints. A selected target uses its matching worksheet; an all-table run uses the `Snowflake_table_names` worksheet. |
 | 4D source | `connections/fourd_connection.py` opens an ODBC connection. The runner issues a mapped `SELECT` query against the source table. |
 | Full-load extraction | `etl/load.py` uses `fetchmany()` batches, writes temporary JSON chunks, and bulk-loads them using Snowflake `PUT` and `COPY INTO`. The optional file-based runner streams to one Parquet or CSV file. |
-| Extraction-only Parquet | `scripts/extract_table_to_csv.py` writes one final Parquet file by default (or CSV with `--format csv`). Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams counted chunks to a bounded worker pool. This command does not connect to Snowflake. |
+| Extraction-only Parquet | `scripts/extract_table_to_csv.py` writes one final Parquet file by default (or CSV with `--format csv`). Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams counted chunks to a bounded worker pool. Snowflake is required for per-table audit logging, but extracted data is not uploaded. |
 | Snowflake raw table | `connections/snowflake_connection.py` opens the Snowflake connection. The runner creates or prepares the mapped target table and inserts the rows. |
 | `ETL_PIPELINE_LOG` | `etl/audit.py` records pipeline and step audit events in the configured Snowflake database and schema. |
 | Incremental state and batch tables | `etl/incremental.py` creates `ETL_INCREMENTAL_TABLE_STATE`, `ETL_SOURCE_ROW_STATE`, and `ETL_INCREMENTAL_BATCH_LOG` when incremental mode is used. |
@@ -71,6 +71,11 @@ py -3.12 scripts\extract_table_to_csv.py `
   --table ACCOUNT_CONTACTS `
   --export-dir exports
 ```
+
+The command connects to Snowflake and records each table's extraction or skip
+in `ETL_PIPELINE_LOG` using the configured database and schema. Logging is
+required; failure to connect or write the audit log causes a nonzero exit.
+If the final audit write fails, the extracted file may already exist.
 
 Pass `--table all` to extract all indexed names that have mapping worksheets
 and mapping rows. Unmapped names are reported and skipped. In Parquet mode,

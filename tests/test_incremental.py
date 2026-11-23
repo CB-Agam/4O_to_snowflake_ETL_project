@@ -419,6 +419,22 @@ class IncrementalStrategyTests(unittest.TestCase):
 
         connection.rollback.assert_called_once()
 
+    @patch.object(incremental, "_acquire_lock")
+    @patch.object(incremental, "_ensure_state_table", return_value="STATE")
+    def test_table_lock_can_reuse_existing_strategy(self, _ensure, acquire):
+        cursor = Mock()
+        cursor.execute.return_value = cursor
+        cursor.fetchall.return_value = [("KEY_TIMESTAMP",)]
+        connection = Mock()
+
+        lock = incremental.acquire_table_run_lock(
+            cursor, connection, "DB", "RAW", "MESSAGES_PARQUET_RAW", [],
+            reuse_existing_strategy=True,
+        )
+
+        self.assertEqual(lock["strategy"], "KEY_TIMESTAMP")
+        self.assertEqual(acquire.call_args.args[4], "KEY_TIMESTAMP")
+
 
 class IncrementalTransactionTests(unittest.TestCase):
     def _patch_initial_dependencies(self, stack):
