@@ -7,8 +7,6 @@ import sys
 import traceback
 from pathlib import Path
 
-import pandas as pd
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -22,10 +20,9 @@ from connections.snowflake_connection import (
 )
 from etl.audit import SnowflakeAuditLogger
 from etl.csv_export import export_table_to_csv_parallel
-from etl.metadata import load_metadata_from_excel
 from etl.parallel_parquet_export import export_table_to_parquet_parallel
+from etl.parquet_export import _safe_path_component
 
-DEFAULT_EXCEL_PATH = PROJECT_ROOT / "4D_to_Snowflake (1-50 tables mapping).xlsx"
 DEFAULT_EXPORT_DIR = PROJECT_ROOT / "exports"
 logger = logging.getLogger(__name__)
 
@@ -62,57 +59,50 @@ def _worker_count(value: str) -> int:
     return count
 
 
-def _matching_mapping_sheets(
-    sheet_names: list[str],
-    table_name: str,
-) -> list[str]:
-    expected = _normalize_name(table_name)
-    return [
-        sheet
-        for sheet in sheet_names
-        if _normalize_name(sheet) == expected
-    ]
-
-
-def _find_mapping_sheet(excel_path: Path, table_name: str) -> str:
-    with pd.ExcelFile(excel_path) as workbook:
-        matches = _matching_mapping_sheets(workbook.sheet_names, table_name)
-    if len(matches) != 1:
-        raise ValueError(
-            f"Expected one mapping worksheet matching {table_name!r}; found {matches}"
-        )
-    return matches[0]
-
-
-def _load_all_table_names(excel_path: Path) -> list[str]:
-    table_index = pd.read_excel(excel_path, sheet_name="Snowflake_table_names")
-    if table_index.empty or len(table_index.columns) == 0:
-        raise ValueError("The Snowflake_table_names worksheet contains no tables")
-
-    table_names = []
-    seen_names = set()
-    for value in table_index.iloc[:, 0]:
-        if pd.isna(value):
+def _discover_tables(connection) -> list[str]:
+    cursor = connection.cursor()
+    try:
+        rows = list(cursor.tables(tableType="TABLE"))
+    finally:
+        cursor.close()
+    names = []
+    for row in rows:
+        table_type = getattr(row, "table_type", None)
+        if table_type and str(table_type).strip().upper() != "TABLE":
             continue
-        table_name = str(value).strip()
-        normalized_name = _normalize_name(table_name)
-        if normalized_name and normalized_name not in seen_names:
-            table_names.append(table_name)
-            seen_names.add(normalized_name)
-    if not table_names:
-        raise ValueError("The Snowflake_table_names worksheet contains no tables")
-    return table_names
+        name = str(row.table_name or "").strip()
+        if not name:
+            raise ValueError("4D returned a table with an empty name")
+        names.append(name)
+    if not names:
+        raise ValueError("4D returned no accessible tables")
+    return names
 
 
-def _mapped_target_table(mapping_rows: list[dict[str, str]]) -> str:
-    return next(
-        row["target_table"].strip()
-        for row in mapping_rows
-        if row.get("source_table", "").strip()
-        and row.get("source_column", "").strip()
-        and row.get("target_table", "").strip()
-        and row.get("target_column", "").strip()
-    )
+def _source_mapping(connection, table_name: str, target_table: str) -> list[dict[str, str]]:
+    cursor = connection.cursor()
+    try:
+        columns = list(cursor.columns(table=table_name))
+    finally:
+        cursor.close()
+    rows = []
+    for column in columns:
+        if str(column.table_name or "").casefold() != table_name.casefold():
+            continue
+        name = str(column.column_name or "").strip()
+        if not name:
+            raise ValueError(f"4D returned an empty column name for {table_name}")
+        rows.append({
+            "source_table": table_name,
+            "source_column": name,
+            "source_data_type": str(column.type_name or ""),
+            "target_table": target_table,
+            "target_column": name,
+            "snowflake_datatype": "VARCHAR",
+        })
+    if not rows:
+        raise ValueError(f"4D returned no columns for table {table_name!r}")
+    return rows
 
 
 def _has_parquet_export(export_dir: Path, target_table: str) -> Path | None:
@@ -128,7 +118,7 @@ def _has_parquet_export(export_dir: Path, target_table: str) -> Path | None:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract mapped 4D tables to final local Parquet files "
+            "Extract all columns of 4D tables to final local Parquet files "
             "(or CSV with --format csv), and record extraction status in "
             "Snowflake ETL_PIPELINE_LOG. No extracted data is uploaded."
         )
@@ -136,17 +126,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--table",
         required=True,
-        help="Mapped source/target table name, or 'all' for every indexed table",
-    )
-    parser.add_argument(
-        "--excel",
-        type=Path,
-        default=DEFAULT_EXCEL_PATH,
-        help="Mapping workbook path",
-    )
-    parser.add_argument(
-        "--sheet",
-        help="Mapping worksheet name (defaults to the worksheet matching --table)",
+        help="4D table name, or 'all' for every accessible table",
     )
     parser.add_argument(
         "--fetch-size",
@@ -212,66 +192,49 @@ def main(argv: list[str] | None = None) -> int:
         audit.ensure_table()
         run_id = args.run_id or audit.run_id
         step_name = f"{args.output_format.upper()}_EXTRACTION"
-        if not args.excel.is_file():
-            raise FileNotFoundError(f"Mapping workbook not found: {args.excel}")
         all_tables = _normalize_name(args.table) == "ALL"
-        if all_tables and args.sheet:
-            raise ValueError("--sheet cannot be used with --table all")
+        try:
+            source_connection = connect_to_4d()
+            discovered = _discover_tables(source_connection)
+        except Exception as exc:
+            audit.record(
+                step_name, "FAILED", args.table,
+                f"Could not discover 4D tables: {exc}",
+                error_message=traceback.format_exc(),
+            )
+            raise
+        table_names = (
+            discovered
+            if all_tables
+            else [
+                name for name in discovered
+                if _normalize_name(name) == _normalize_name(args.table)
+            ]
+        )
+        if not table_names:
+            message = f"No 4D table matches {args.table!r}"
+            audit.record(step_name, "FAILED", args.table, message)
+            raise ValueError(message)
+        normalized_names = [_normalize_name(name) for name in table_names]
+        if len(normalized_names) != len(set(normalized_names)):
+            message = (
+                "4D table names are ambiguous after normalization; "
+                "cannot safely choose unique export destinations"
+            )
+            audit.record(step_name, "FAILED", args.table, message)
+            raise ValueError(message)
 
         selected_tables = []
-        table_names = (
-            _load_all_table_names(args.excel) if all_tables else [args.table]
-        )
-        mapping_sheets = None
-        if all_tables:
-            with pd.ExcelFile(args.excel) as workbook:
-                mapping_sheets = workbook.sheet_names
         for table_name in table_names:
             try:
-                if all_tables:
-                    matches = _matching_mapping_sheets(
-                        mapping_sheets or [],
-                        table_name,
-                    )
-                    if not matches:
-                        message = (
-                            f"Skipping {table_name}: no matching mapping worksheet"
-                        )
-                        logger.warning(message)
-                        print(message)
-                        _record_skip(audit, step_name, table_name, message)
-                        continue
-                    if len(matches) != 1:
-                        raise ValueError(
-                            f"Expected one mapping worksheet matching "
-                            f"{table_name!r}; found {matches}"
-                        )
-                    sheet_name = matches[0]
-                else:
-                    sheet_name = args.sheet or _find_mapping_sheet(
-                        args.excel, table_name
-                    )
-                metadata = load_metadata_from_excel(
-                    str(args.excel),
-                    sheet_name=sheet_name,
-                )
-                mapping_rows = metadata.get(_normalize_name(table_name))
-                if not mapping_rows:
-                    if all_tables:
-                        message = (
-                            f"Skipping {table_name}: no source-to-target "
-                            f"mapping in worksheet {sheet_name!r}"
-                        )
-                        logger.warning(message)
-                        print(message)
-                        _record_skip(audit, step_name, table_name, message)
-                        continue
+                target_table = _normalize_name(table_name)
+                if _safe_path_component(target_table, "Target table") != target_table:
                     raise ValueError(
-                        f"No source-to-target mapping found for {table_name!r} "
-                        f"in worksheet {sheet_name!r}"
+                        f"4D table name cannot be used safely as an export target: "
+                        f"{table_name!r}"
                     )
-
-                target_table = _mapped_target_table(mapping_rows)
+                if len(target_table) > 255:
+                    raise ValueError(f"Target table name is too long: {target_table!r}")
                 if all_tables and args.output_format == "parquet":
                     existing_file = _has_parquet_export(
                         args.export_dir,
@@ -286,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
                         print(message)
                         _record_skip(audit, step_name, target_table, message)
                         continue
+                mapping_rows = _source_mapping(source_connection, table_name, target_table)
                 selected_tables.append((table_name, target_table, mapping_rows))
             except AuditLoggingError:
                 raise
@@ -298,18 +262,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 exit_code = 1
 
-        if selected_tables:
-            try:
-                source_connection = connect_to_4d()
-            except Exception as exc:
-                error = traceback.format_exc()
-                for _, target_table, _ in selected_tables:
-                    audit.record(
-                        step_name, "FAILED", target_table,
-                        f"Could not connect to 4D: {exc}",
-                        error_message=error,
-                    )
-                raise
         for table_name, target_table, mapping_rows in selected_tables:
             table_step = audit.record(
                 step_name, "RUNNING", target_table,

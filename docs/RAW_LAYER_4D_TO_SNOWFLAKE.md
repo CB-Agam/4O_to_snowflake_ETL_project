@@ -36,7 +36,7 @@ The diagram is also available as an editable vector source:
 | Mapping workbook | `4D_to_Snowflake (1-50 tables mapping).xlsx` describes source tables and columns, target names and types, and mapping constraints. A selected target uses its matching worksheet; an all-table run uses the `Snowflake_table_names` worksheet. |
 | 4D source | `connections/fourd_connection.py` opens an ODBC connection. The runner issues a mapped `SELECT` query against the source table. |
 | Full-load extraction | `etl/load.py` uses `fetchmany()` batches, writes temporary JSON chunks, and bulk-loads them using Snowflake `PUT` and `COPY INTO`. The optional file-based runner streams to one Parquet or CSV file. |
-| Extraction-only Parquet | `scripts/extract_table_to_csv.py` writes one final Parquet file by default (or CSV with `--format csv`). Mapped integer primary keys enable independent 4D key-range workers; without a key, one cursor streams counted chunks to a bounded worker pool. Snowflake is required for per-table audit logging, but extracted data is not uploaded. |
+| Extraction-only Parquet | `scripts/extract_table_to_csv.py` discovers 4D tables and columns through ODBC and writes Parquet (or CSV). One cursor streams counted chunks to workers. Snowflake is required for per-table audit logging, but extracted data is not uploaded. |
 | Snowflake raw table | `connections/snowflake_connection.py` opens the Snowflake connection. The runner creates or prepares the mapped target table and inserts the rows. |
 | `ETL_PIPELINE_LOG` | `etl/audit.py` records pipeline and step audit events in the configured Snowflake database and schema. |
 | Incremental state and batch tables | `etl/incremental.py` creates `ETL_INCREMENTAL_TABLE_STATE`, `ETL_SOURCE_ROW_STATE`, and `ETL_INCREMENTAL_BATCH_LOG` when incremental mode is used. |
@@ -77,10 +77,10 @@ in `ETL_PIPELINE_LOG` using the configured database and schema. Logging is
 required; failure to connect or write the audit log causes a nonzero exit.
 If the final audit write fails, the extracted file may already exist.
 
-Pass `--table all` to extract all indexed names that have mapping worksheets
-and mapping rows. Unmapped names are reported and skipped. In Parquet mode,
-tables with an existing Parquet file under `exports\<TARGET_TABLE>` are also
-skipped:
+Pass `--table all` to discover accessible 4D tables without the workbook.
+In Parquet mode, tables with an existing Parquet file under
+`exports\<TARGET_TABLE>` are skipped. Older workbook-based files may contain
+only mapped columns and are not updated by this skip:
 
 ```powershell
 py -3.12 scripts\extract_table_to_csv.py `
@@ -92,30 +92,24 @@ py -3.12 scripts\extract_table_to_csv.py `
 `--workers` accepts 1-3 (default 3). The fetch size is calculated from the
 source row count and worker count, capped at 100,000 rows; `--fetch-size` may
 still be supplied to override it. The output defaults to Parquet; pass
-`--format csv` to request CSV. With a mapped integer-compatible primary-key
-column, extraction uses separate 4D connections and disjoint key ranges sized
-using row-count quantiles. For a composite key, an integer-compatible mapped
-component may be used for range partitioning; rows sharing a component value
-stay in the same range. The 4D ODBC driver's concurrent connection behavior
-remains unverified, so begin with one worker and use multiple workers only
-after confirming support against a development database.
-
-If no primary key is mapped, the exporter counts the table and reads through
-one 4D cursor in dynamically sized chunks (at most 100,000 rows). Up to three
+`--format csv` to request CSV. Without workbook primary-key mappings, the
+exporter counts the table and reads through one 4D cursor in dynamically
+sized chunks (at most 100,000 rows). Up to three
 workers process these extracted tasks concurrently, and more tasks are
 scheduled as workers finish. Because
 the server rejected `ROW_NUMBER()`/`ROWNUM` and paging syntax has not been
 confirmed, this path does not parallelize source reads or use `OFFSET`.
-If no mapped primary-key component is integer-compatible, the same counted,
-single-cursor task path is used. Parquet schemas and source/extracted row
-counts are checked before completion. Keep the table stable during export
+Parquet schemas and source/extracted row counts are checked before completion.
+Keep the table stable during export
 because row-count reconciliation cannot detect every simultaneous source
 change.
 
-Both paths merge task files in order and leave one final file at
+The exporter merges task files in order and leaves one final file at
 `exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.parquet`. Values are stored
-as mapped strings and SQL NULL is preserved as a Parquet null. The final file
-path and row count are printed for the subsequent loading stage.
+as strings and SQL NULL is preserved as a Parquet null. Binary values are
+encoded as `base64:`-prefixed strings. Column names come from 4D; target table
+names are uppercased with spaces and hyphens replaced by underscores. The
+final file path and row count are printed for the subsequent loading stage.
 
 ## Execution sequence
 

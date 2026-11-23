@@ -57,8 +57,9 @@ py -3.12 scripts\run_initial_etl.py --table Alerts --batch-size 50000
 
 ## Extraction-only Parquet export
 
-Extract one mapped table, or every indexed table with a mapping worksheet, to
-local files without transformations or uploading extracted data to Snowflake.
+Extract every column of one 4D table, or every accessible 4D table, to local
+files without an Excel workbook, transformations, or uploading extracted data
+to Snowflake. Table and column names are discovered using 4D ODBC metadata.
 The command requires Snowflake for audit logging. The worker count defaults to
 3, and the code calculates the fetch size from the source row count (up to
 100,000):
@@ -69,10 +70,10 @@ The command requires Snowflake for audit logging. The worker count defaults to
   --export-dir exports
 ```
 
-For all indexed tables, use `--table all`. Entries without a mapping worksheet
-or mapping rows are reported and skipped. In Parquet mode, a table is also
-skipped when a Parquet file already exists under its
-`exports\<TARGET_TABLE>` folder:
+For all discovered tables, use `--table all`. In Parquet mode, a table is
+skipped when a Parquet file already exists under its `exports\<TARGET_TABLE>`
+folder. Older files created using the workbook may contain only mapped columns;
+they are not updated by this skip behavior:
 
 ```powershell
 .\env_etl\Scripts\python.exe scripts\extract_table_to_csv.py `
@@ -123,27 +124,17 @@ contain only the columns extracted originally; this uploader cannot recover
 columns that are absent from them. It accepts text-column Parquet exports
 with `target_table` metadata, not arbitrary Parquet files.
 
-When the mapping has an integer-compatible primary-key column, extraction
-uses separate 4D connections and disjoint key ranges sized by approximate
-row-count quantiles, rather than equal numeric key spans. For a composite key,
-an integer-compatible mapped component can be used to divide the ranges;
-duplicate component values remain together in the same range. When no primary
-key is mapped (or no mapped key component is integer-compatible),
-the source is read through one 4D cursor in chunks calculated from the source
-count and worker count (never larger than 100,000 rows); up to three worker
-threads process those chunks, and later tasks are scheduled as workers finish.
-This avoids unsupported row-number SQL but does not parallelize the 4D read
-for a table without a key.
-
-Both paths reconcile row counts and merge completed task files in order before
+Without workbook primary-key mappings, the source is read through one 4D cursor
+in chunks calculated from the source count and worker count (never larger than
+100,000 rows); up to three worker threads process those chunks. The command
+reconciles row counts and merges completed task files in order before
 publishing one file at
-`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.parquet`. Values are stored
-as mapped strings and SQL NULL is preserved as a Parquet null. Only the final
-file is left for the later load step. The source table should remain stable
-during extraction. Concurrent 4D connections for primary-key parallel
-extraction remain driver/server dependent; use `--workers 1` until support is
-confirmed in a development environment. The Snowflake connection is used only
-for audit logging, not for uploading extracted data.
+`exports\<TARGET_TABLE>\<RUN_ID>\<target_table>.parquet`. Target table names
+are uppercased, with spaces and hyphens replaced by underscores; column names
+come from 4D. Values are stored as strings and SQL NULL as a Parquet null.
+Binary values use a `base64:`-prefixed representation. Only the final file is
+left for the later load step. The source table should remain stable during
+extraction. The Snowflake connection is used only for audit logging.
 
 ## Chunked file-based end-to-end ETL
 
