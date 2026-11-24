@@ -27,6 +27,12 @@ from etl.source_extract import SourceRowCountUnavailable
 DEFAULT_EXPORT_DIR = PROJECT_ROOT / "exports"
 logger = logging.getLogger(__name__)
 
+# Tables to skip during extraction (add more as needed)
+TABLES_TO_SKIP = {
+    "Acc_User_Passwords",  # ODBC error 08004 - Server rejected connection
+}
+
+
 
 class AuditLoggingError(RuntimeError):
     pass
@@ -234,6 +240,14 @@ def main(argv: list[str] | None = None) -> int:
         selected_tables = []
         for table_name in table_names:
             try:
+                # Skip tables in the skip list
+                if table_name in TABLES_TO_SKIP:
+                    message = f"Skipping {table_name}: Table is in skip list (blacklisted)"
+                    logger.info(message)
+                    print(message)
+                    _record_skip(audit, step_name, table_name, message)
+                    continue
+                
                 target_table = _normalize_name(table_name)
                 if _safe_path_component(target_table, "Target table") != target_table:
                     raise ValueError(
