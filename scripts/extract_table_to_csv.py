@@ -172,12 +172,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=settings.snowflake_schema,
         help="Snowflake audit schema (defaults to SNOWFLAKE_SCHEMA)",
     )
+    parser.add_argument(
+        "--no-file-logging",
+        action="store_true",
+        default=False,
+        help="Disable file logging, only log to Snowflake audit table",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    configure_logging()
     args = _parse_args(argv)
+    configure_logging(disable_file_logging=args.no_file_logging)
     source_connection = None
     snowflake_connection = None
     exit_code = 0
@@ -262,6 +268,9 @@ def main(argv: list[str] | None = None) -> int:
                     error_message=traceback.format_exc(),
                 )
                 exit_code = 1
+        
+        print(f"Prepared {len(selected_tables)} tables for extraction")
+        logger.info("Prepared %d tables for extraction", len(selected_tables))
 
         for table_name, target_table, mapping_rows in selected_tables:
             table_step = audit.record(
@@ -341,6 +350,13 @@ def main(argv: list[str] | None = None) -> int:
                     error_message=traceback.format_exc(),
                 )
                 exit_code = 1
+                try:
+                    close_4d_connection(source_connection)
+                    source_connection = connect_to_4d()
+                    logger.info("Reconnected to 4D after extraction failure")
+                except Exception as reconnect_exc:
+                    logger.exception("Failed to reconnect to 4D after extraction error")
+                    raise reconnect_exc
                 continue
             audit.finish_step(
                 table_step,
@@ -374,6 +390,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             for path in output_paths:
                 print(path)
+        
+        logger.info("All %d tables processed", len(selected_tables))
+        print(f"Extraction run complete: {len(selected_tables)} tables processed")
     except Exception:
         logger.exception("Extraction or audit logging failed for %s", args.table)
         exit_code = 1
