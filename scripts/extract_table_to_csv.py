@@ -272,7 +272,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Prepared {len(selected_tables)} tables for extraction")
         logger.info("Prepared %d tables for extraction", len(selected_tables))
 
+        processed_count = 0
         for table_name, target_table, mapping_rows in selected_tables:
+            processed_count += 1
             table_step = audit.record(
                 step_name, "RUNNING", target_table,
                 json.dumps({"export_run_id": run_id, "format": args.output_format}),
@@ -332,6 +334,38 @@ def main(argv: list[str] | None = None) -> int:
                         ";".join(str(path) for path in result.file_paths),
                     )
                     output_paths = result.file_paths
+                audit.finish_step(
+                    table_step,
+                    "SUCCESS",
+                    json.dumps(
+                        {
+                            "export_run_id": result.run_id,
+                            "format": args.output_format,
+                            "rows": result.row_count,
+                            "files": [str(path) for path in output_paths],
+                            "workers": result.worker_count,
+                            "fetch_size": result.fetch_size,
+                            "query_seconds": result.query_seconds,
+                            "fetch_seconds": result.fetch_seconds,
+                            "serialization_seconds": result.serialization_seconds,
+                            "file_write_seconds": (
+                                result.parquet_write_seconds
+                                if args.output_format == "parquet"
+                                else result.csv_write_seconds
+                            ),
+                            "total_seconds": result.total_seconds,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+                print(
+                    f"Extraction completed: format={args.output_format} "
+                    f"table={result.target_table} rows={result.row_count} "
+                    f"workers={result.worker_count} "
+                    f"fetch_size={result.fetch_size} files={len(output_paths)}"
+                )
+                for path in output_paths:
+                    print(path)
             except SourceRowCountUnavailable as exc:
                 details = {
                     "reason": "SOURCE_ROW_COUNT_UNAVAILABLE",
@@ -341,7 +375,6 @@ def main(argv: list[str] | None = None) -> int:
                 logger.warning("Skipping %s: %s; row count unknown", table_name, exc)
                 audit.finish_step(table_step, "SKIPPED", json.dumps(details, sort_keys=True))
                 print(f"Skipping {table_name}: {exc}; row count unknown")
-                continue
             except Exception as exc:
                 logger.exception("4D extraction failed for %s", table_name)
                 print(f"Extraction failed for {table_name}: {exc}")
@@ -355,44 +388,10 @@ def main(argv: list[str] | None = None) -> int:
                     source_connection = connect_to_4d()
                     logger.info("Reconnected to 4D after extraction failure")
                 except Exception as reconnect_exc:
-                    logger.exception("Failed to reconnect to 4D after extraction error")
-                    raise reconnect_exc
-                continue
-            audit.finish_step(
-                table_step,
-                "SUCCESS",
-                json.dumps(
-                    {
-                        "export_run_id": result.run_id,
-                        "format": args.output_format,
-                        "rows": result.row_count,
-                        "files": [str(path) for path in output_paths],
-                        "workers": result.worker_count,
-                        "fetch_size": result.fetch_size,
-                        "query_seconds": result.query_seconds,
-                        "fetch_seconds": result.fetch_seconds,
-                        "serialization_seconds": result.serialization_seconds,
-                        "file_write_seconds": (
-                            result.parquet_write_seconds
-                            if args.output_format == "parquet"
-                            else result.csv_write_seconds
-                        ),
-                        "total_seconds": result.total_seconds,
-                    },
-                    sort_keys=True,
-                ),
-            )
-            print(
-                f"Extraction completed: format={args.output_format} "
-                f"table={result.target_table} rows={result.row_count} "
-                f"workers={result.worker_count} "
-                f"fetch_size={result.fetch_size} files={len(output_paths)}"
-            )
-            for path in output_paths:
-                print(path)
+                    logger.exception("Failed to reconnect to 4D after extraction error; continuing anyway")
         
-        logger.info("All %d tables processed", len(selected_tables))
-        print(f"Extraction run complete: {len(selected_tables)} tables processed")
+        logger.info("Extraction loop completed: processed %d of %d tables", processed_count, len(selected_tables))
+        print(f"Extraction run complete: {processed_count} of {len(selected_tables)} tables processed")
     except Exception:
         logger.exception("Extraction or audit logging failed for %s", args.table)
         exit_code = 1
