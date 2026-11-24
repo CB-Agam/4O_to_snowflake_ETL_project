@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # Tables to skip during extraction (add more as needed)
 TABLES_TO_SKIP = {
     "Acc_User_Passwords",  # ODBC error 08004 - Server rejected connection
+    "Application",
 }
 
 
