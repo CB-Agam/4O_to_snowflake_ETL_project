@@ -275,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         processed_count = 0
         for table_name, target_table, mapping_rows in selected_tables:
             processed_count += 1
+            print(f"[{processed_count}/{len(selected_tables)}] Processing table: {table_name}")
+            logger.info("Processing table %d/%d: %s", processed_count, len(selected_tables), table_name)
             table_step = audit.record(
                 step_name, "RUNNING", target_table,
                 json.dumps({"export_run_id": run_id, "format": args.output_format}),
@@ -392,8 +394,10 @@ def main(argv: list[str] | None = None) -> int:
         
         logger.info("Extraction loop completed: processed %d of %d tables", processed_count, len(selected_tables))
         print(f"Extraction run complete: {processed_count} of {len(selected_tables)} tables processed")
-    except Exception:
-        logger.exception("Extraction or audit logging failed for %s", args.table)
+    except Exception as outer_exc:
+        logger.exception("OUTER EXCEPTION - Extraction or audit logging failed for %s: %s", args.table, outer_exc)
+        print(f"ERROR: Extraction stopped unexpectedly: {outer_exc}")
+        print(f"Processed {processed_count} tables before stopping")
         exit_code = 1
     finally:
         if source_connection is not None:
