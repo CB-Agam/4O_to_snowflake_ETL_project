@@ -55,7 +55,7 @@ TABLES_TO_SKIP = {
     "Profile TP Limit Items",
     "Proposals",
     "Risk EB Employee Action Log","Risk EB Employees","Risk Extensions","SBX_Documents","SBX_Files","SBX_Pending Deletions","SBX_Photos","SBX_Schedules","Surveys",
-    "System_Actions","Web Payment Request Log","Web_Proposal_Questions","zSubtable_Do_Not_Use"
+    "System_Actions","Web Payment Request Log","Web_Proposal_Questions","zSubtable_Do_Not_Use","Background Images",
 }
 
 
@@ -314,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Prepared %d tables for extraction", len(selected_tables))
 
         processed_count = 0
+        last_table_step = None
+        last_table_name = None
         for table_name, target_table, mapping_rows in selected_tables:
             processed_count += 1
             print(f"[{processed_count}/{len(selected_tables)}] Processing table: {table_name}")
@@ -322,6 +324,9 @@ def main(argv: list[str] | None = None) -> int:
                 step_name, "RUNNING", target_table,
                 json.dumps({"export_run_id": run_id, "format": args.output_format}),
             )
+            # Track last table step in case of crash
+            last_table_step = table_step
+            last_table_name = table_name
             try:
                 if args.output_format == "parquet":
                     result = export_table_to_parquet_parallel(
@@ -467,9 +472,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: Extraction stopped unexpectedly: {outer_exc}")
         print(f"Processed {processed_count} tables before stopping")
         
-        # Record the reason for stopping to audit table
+        # Update the last RUNNING table record to STOPPED if there is one
+        if last_table_step is not None:
+            try:
+                stop_message = f"Table {last_table_name} extraction stopped unexpectedly. Reason: {str(outer_exc)}"
+                audit.finish_step(
+                    last_table_step,
+                    "STOPPED",
+                    stop_message,
+                    error_message=traceback.format_exc(),
+                )
+                logger.info("Updated last table record status to STOPPED: %s", last_table_name)
+                print(f"Updated table {last_table_name} status to STOPPED in audit table")
+            except Exception as audit_exc:
+                logger.exception("Could not update last table step in audit table: %s", audit_exc)
+        
+        # Record the reason for stopping to audit table (process-level record)
         try:
-            stop_reason = f"Extraction stopped after processing {processed_count} tables. Reason: {str(outer_exc)}"
+            stop_reason = f"Extraction stopped after processing {processed_count} tables. Last table: {last_table_name}. Reason: {str(outer_exc)}"
             audit.record(
                 step_name, "STOPPED", f"EXTRACTION_PROCESS_{args.table}",
                 stop_reason,
