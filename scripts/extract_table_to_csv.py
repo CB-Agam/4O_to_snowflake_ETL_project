@@ -57,6 +57,7 @@ TABLES_TO_SKIP = {
     "Proposals",
     "Risk EB Employee Action Log","Risk EB Employees","Risk Extensions","SBX_Documents","SBX_Files","SBX_Pending Deletions","SBX_Photos","SBX_Schedules","Surveys",
     "System_Actions","Web Payment Request Log","Web_Proposal_Questions","zSubtable_Do_Not_Use","Background Images",
+    "Access Privileges","ACC_CHEQUE_PAYMENTS","Account Accumulations","Account Contacts","Accounts","Accounts Aging Item","Accounts Aging Table","ACH Transactions","ACH Transmission Log","Adjustment","Agent Commissions","Alerts","Allocations","Audit Trail","Bank Accounts Table","Branch MasterFile",
 }
 
 # Global tracking for signal handler
