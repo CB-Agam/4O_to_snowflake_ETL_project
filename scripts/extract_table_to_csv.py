@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 import traceback
 from pathlib import Path
@@ -58,6 +59,27 @@ TABLES_TO_SKIP = {
     "System_Actions","Web Payment Request Log","Web_Proposal_Questions","zSubtable_Do_Not_Use","Background Images",
 }
 
+# Global tracking for signal handler
+_current_audit = None
+_last_table_step = None
+_last_table_name = None
+
+
+def _handle_signal(signum, frame):
+    """Handle Ctrl+C or other signals to update audit before exit"""
+    global _current_audit, _last_table_step, _last_table_name
+    if _current_audit and _last_table_step is not None:
+        try:
+            sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+            _current_audit.finish_step(
+                _last_table_step, "STOPPED",
+                f"Extraction interrupted by signal {sig_name} while processing {_last_table_name}",
+                error_message=f"Process received signal {sig_name}\n{traceback.format_stack()}"
+            )
+            logger.info("Updated last table record on signal %s", sig_name)
+        except Exception as e:
+            logger.exception("Could not update audit on signal: %s", e)
+    sys.exit(1)
 
 
 class AuditLoggingError(RuntimeError):
@@ -219,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     source_connection = None
     snowflake_connection = None
     exit_code = 0
+    global _current_audit
     try:
         if not args.database.strip() or not args.schema.strip():
             raise ValueError(
@@ -228,7 +251,14 @@ def main(argv: list[str] | None = None) -> int:
         audit = SnowflakeAuditLogger(
             snowflake_connection, args.database, args.schema
         )
+        _current_audit = audit  # Set global for signal handler
         audit.ensure_table()
+        # Register signal handlers for Ctrl+C and other signals
+        signal.signal(signal.SIGINT, _handle_signal)
+        try:
+            signal.signal(signal.SIGTERM, _handle_signal)
+        except (AttributeError, ValueError):
+            pass  # SIGTERM not available on all platforms
         run_id = args.run_id or audit.run_id
         step_name = f"{args.output_format.upper()}_EXTRACTION"
         all_tables = _normalize_name(args.table) == "ALL"
@@ -317,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         last_table_step = None
         last_table_name = None
         for table_name, target_table, mapping_rows in selected_tables:
+            global _last_table_step, _last_table_name
             processed_count += 1
             print(f"[{processed_count}/{len(selected_tables)}] Processing table: {table_name}")
             logger.info("Processing table %d/%d: %s", processed_count, len(selected_tables), table_name)
@@ -324,9 +355,11 @@ def main(argv: list[str] | None = None) -> int:
                 step_name, "RUNNING", target_table,
                 json.dumps({"export_run_id": run_id, "format": args.output_format}),
             )
-            # Track last table step in case of crash
+            # Track last table step in case of crash (both local and global for signal handler)
             last_table_step = table_step
             last_table_name = table_name
+            _last_table_step = table_step  # Global for signal handler
+            _last_table_name = table_name  # Global for signal handler
             try:
                 if args.output_format == "parquet":
                     result = export_table_to_parquet_parallel(
@@ -431,12 +464,24 @@ def main(argv: list[str] | None = None) -> int:
                     error_message=traceback.format_exc(),
                 )
                 exit_code = 1
+                # Try to reconnect to 4D for next table
                 try:
                     close_4d_connection(source_connection)
                     source_connection = connect_to_4d()
                     logger.info("Reconnected to 4D after extraction failure")
                 except Exception as reconnect_exc:
-                    logger.exception("Failed to reconnect to 4D after extraction error; continuing anyway")
+                    logger.exception("Failed to reconnect to 4D after extraction error")
+                    # Update last_table_step to FAILED since we can't reconnect
+                    try:
+                        audit.finish_step(
+                            table_step, "FAILED", 
+                            f"Extraction failed and reconnection failed: {reconnect_exc}",
+                            error_message=traceback.format_exc(),
+                        )
+                    except Exception:
+                        logger.exception("Could not update table step after reconnection failure")
+                    # Exit the loop since we can't continue without connection
+                    break
         
         logger.info("Extraction loop completed: processed %d of %d tables", processed_count, len(selected_tables))
         print(f"Extraction run complete: {processed_count} of {len(selected_tables)} tables processed")
