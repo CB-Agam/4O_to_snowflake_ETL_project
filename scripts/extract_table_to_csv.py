@@ -31,6 +31,31 @@ logger = logging.getLogger(__name__)
 TABLES_TO_SKIP = {
     "Acc_User_Passwords",  # ODBC error 08004 - Server rejected connection
     "Application",
+    "Acc_Cashed_Cheque_Allocations",
+    "Acc_Cashed_Cheques",
+    "Account Joint Holders",
+    "Account Reward Points",
+    "Batches",
+    "Budget_Table",
+    "Claims_Relations",
+    "Communications Log",
+    "Converted Data Instructions",
+    "Dialogs",
+    "EB Claims",
+    "EB Claims Service Dates",
+    "Global Events",
+    "Global_Driver_Convictions",
+    "Holidays",
+    "Marine Vessel Categories",
+    "Mirror_Configs",
+    "Payment Plans Terms",
+    "Policy Payment Plans",
+    "Policy Payment Plans Terms",
+    "Portfolios",
+    "Profile TP Limit Items",
+    "Proposals",
+    "Risk EB Employee Action Log","Risk EB Employees","Risk Extensions","SBX_Documents","SBX_Files","SBX_Pending Deletions","SBX_Photos","SBX_Schedules","Surveys",
+    "System_Actions","Web Payment Request Log","Web_Proposal_Questions","zSubtable_Do_Not_Use"
 }
 
 
@@ -239,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(message)
 
         selected_tables = []
+        print("table_names>>>>>>>>>>>",table_names)
         for table_name in table_names:
             try:
                 # Skip tables in the skip list
@@ -409,10 +435,51 @@ def main(argv: list[str] | None = None) -> int:
         
         logger.info("Extraction loop completed: processed %d of %d tables", processed_count, len(selected_tables))
         print(f"Extraction run complete: {processed_count} of {len(selected_tables)} tables processed")
+        
+        # Record completion summary
+        tables_remaining = len(selected_tables) - processed_count
+        if tables_remaining > 0:
+            summary_message = f"Extraction completed with {processed_count} tables processed, {tables_remaining} tables remaining"
+            logger.warning(summary_message)
+            print(f"WARNING: {summary_message}")
+            try:
+                audit.record(
+                    step_name, "PARTIAL_COMPLETE", f"EXTRACTION_PROCESS_{args.table}",
+                    summary_message,
+                )
+                logger.info("Recorded partial completion to audit table")
+            except Exception as audit_exc:
+                logger.exception("Could not record partial completion to audit table: %s", audit_exc)
+        else:
+            summary_message = f"Extraction completed successfully: all {processed_count} tables processed"
+            logger.info(summary_message)
+            print(f"SUCCESS: {summary_message}")
+            try:
+                audit.record(
+                    step_name, "COMPLETE", f"EXTRACTION_PROCESS_{args.table}",
+                    summary_message,
+                )
+                logger.info("Recorded successful completion to audit table")
+            except Exception as audit_exc:
+                logger.exception("Could not record completion to audit table: %s", audit_exc)
     except Exception as outer_exc:
         logger.exception("OUTER EXCEPTION - Extraction or audit logging failed for %s: %s", args.table, outer_exc)
         print(f"ERROR: Extraction stopped unexpectedly: {outer_exc}")
         print(f"Processed {processed_count} tables before stopping")
+        
+        # Record the reason for stopping to audit table
+        try:
+            stop_reason = f"Extraction stopped after processing {processed_count} tables. Reason: {str(outer_exc)}"
+            audit.record(
+                step_name, "STOPPED", f"EXTRACTION_PROCESS_{args.table}",
+                stop_reason,
+                error_message=traceback.format_exc(),
+            )
+            logger.info("Recorded extraction stop reason to audit table")
+        except Exception as audit_exc:
+            logger.exception("Could not record extraction stop reason to audit table: %s", audit_exc)
+            print(f"WARNING: Could not log stop reason to audit: {audit_exc}")
+        
         exit_code = 1
     finally:
         if source_connection is not None:
