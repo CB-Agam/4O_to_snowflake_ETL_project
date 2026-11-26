@@ -58,7 +58,8 @@ TABLES_TO_SKIP = {
     "Risk EB Employee Action Log","Risk EB Employees","Risk Extensions","SBX_Documents","SBX_Files","SBX_Pending Deletions","SBX_Photos","SBX_Schedules","Surveys",
     "System_Actions","Web Payment Request Log","Web_Proposal_Questions","zSubtable_Do_Not_Use","Background Images",
     "Access Privileges","Acc_Cheque_Payments","Account Accumulations","Account Contacts","Accounts","Accounts Aging Item","Accounts Aging Table","ACH Transactions","ACH Transmission Log","Adjustment","Agent Commissions","Alerts","Allocations","Audit Trail","Bank Accounts Table","Branch MasterFile",
-    "Certificates","Claims","Claims Batches","Claims Checklist","Claims Limits and Extensions","Claims OS Recovery","Claims Partc Intm Pmts","Claims Partc Reserve Pmnts","Claims Partc Reserves","Claims Partc Revision History","Claims Participants","Claims RI Split","Claims Service Actions","Claims Trans","Claims Trans Rcpt Items","Claims Trans RI","Construction Class Table","Construction Type Table","Construction Value Table","Converted Data Instructions","Core_Actions","Core_Actions_Rank Table",
+    "Certificates","Claims","Claims Batches","Claims Checklist","Claims Limits and Extensions","Claims OS Recovery","Claims Partc Intm Pmts","Claims Partc Reserve Pmnts","Claims Partc Reserves","Claims Partc Revision History","Claims Participants","Claims RI Split","Claims Service Actions","Claims Trans","Claims Trans Rcpt Items","Claims Trans RI","Construction Class Table","Construction Type Table","Construction Value Table","Converted Data Instructions","Core_Actions","Core_Actions_Rank Table","Country Masterfile",
+    "Data Toolbox","Delivery Table","Documents",
 }
 
 # Global tracking for signal handler

@@ -17,6 +17,7 @@ logs/
 exports/
 exports1/
 exports2/
+exports3/
 
 # OS files
 .DS_Store
