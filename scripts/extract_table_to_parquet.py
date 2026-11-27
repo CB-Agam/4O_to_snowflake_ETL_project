@@ -20,7 +20,6 @@ from connections.snowflake_connection import (
     connect_to_snowflake,
 )
 from etl.audit import SnowflakeAuditLogger
-from etl.csv_export import export_table_to_csv_parallel
 from etl.parallel_parquet_export import export_table_to_parquet_parallel
 from etl.parquet_export import _safe_path_component
 from etl.source_extract import SourceRowCountUnavailable
@@ -176,8 +175,8 @@ def _has_parquet_export(export_dir: Path, target_table: str) -> Path | None:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract all columns of 4D tables to final local Parquet files "
-            "(or CSV with --format csv), and record extraction status in "
+            "Extract all columns of 4D tables to final local Parquet files and "
+            "record extraction status in "
             "Snowflake ETL_PIPELINE_LOG. No extracted data is uploaded."
         )
     )
@@ -200,13 +199,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=_worker_count,
         default=3,
         help="Workers for extraction tasks (1-3; default: 3)",
-    )
-    parser.add_argument(
-        "--format",
-        dest="output_format",
-        choices=("parquet", "csv"),
-        default="parquet",
-        help="Output file format (default: parquet)",
     )
     parser.add_argument(
         "--export-dir",
@@ -263,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass  # SIGTERM not available on all platforms
         run_id = args.run_id or audit.run_id
-        step_name = f"{args.output_format.upper()}_EXTRACTION"
+        step_name = "PARQUET_EXTRACTION"
         all_tables = _normalize_name(args.table) == "ALL"
         try:
             source_connection = connect_to_4d()
@@ -316,7 +308,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if len(target_table) > 255:
                     raise ValueError(f"Target table name is too long: {target_table!r}")
-                if all_tables and args.output_format == "parquet":
+                if all_tables:
                     existing_file = _has_parquet_export(
                         args.export_dir,
                         target_table,
@@ -356,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("Processing table %d/%d: %s", processed_count, len(selected_tables), table_name)
             table_step = audit.record(
                 step_name, "RUNNING", target_table,
-                json.dumps({"export_run_id": run_id, "format": args.output_format}),
+                json.dumps({"export_run_id": run_id, "format": "parquet"}),
             )
             # Track last table step in case of crash (both local and global for signal handler)
             last_table_step = table_step
@@ -364,67 +356,39 @@ def main(argv: list[str] | None = None) -> int:
             _last_table_step = table_step  # Global for signal handler
             _last_table_name = table_name  # Global for signal handler
             try:
-                if args.output_format == "parquet":
-                    result = export_table_to_parquet_parallel(
-                        source_connection,
-                        mapping_rows,
-                        args.export_dir,
-                        run_id,
-                        connection_factory=connect_to_4d,
-                        fetch_size=args.fetch_size,
-                        worker_count=args.workers,
-                    )
-                    logger.info(
-                        "4D Parquet extraction completed: table=%s rows=%s "
-                        "workers=%s fetch_size=%s query_seconds=%.3f "
-                        "fetch_seconds=%.3f serialization_seconds=%.3f "
-                        "parquet_write_seconds=%.3f total_seconds=%.3f file=%s",
-                        result.target_table,
-                        result.row_count,
-                        result.worker_count,
-                        result.fetch_size,
-                        result.query_seconds,
-                        result.fetch_seconds,
-                        result.serialization_seconds,
-                        result.parquet_write_seconds,
-                        result.total_seconds,
-                        result.file_path,
-                    )
-                    output_paths = (result.file_path,)
-                else:
-                    result = export_table_to_csv_parallel(
-                        source_connection,
-                        mapping_rows,
-                        args.export_dir,
-                        run_id,
-                        connection_factory=connect_to_4d,
-                        fetch_size=args.fetch_size,
-                        worker_count=args.workers,
-                    )
-                    logger.info(
-                        "4D CSV extraction completed: table=%s rows=%s "
-                        "workers=%s fetch_size=%s query_seconds=%.3f "
-                        "fetch_seconds=%.3f serialization_seconds=%.3f "
-                        "csv_write_seconds=%.3f total_seconds=%.3f files=%s",
-                        result.target_table,
-                        result.row_count,
-                        result.worker_count,
-                        result.fetch_size,
-                        result.query_seconds,
-                        result.fetch_seconds,
-                        result.serialization_seconds,
-                        result.csv_write_seconds,
-                        result.total_seconds,
-                        ";".join(str(path) for path in result.file_paths),
-                    )
-                    output_paths = result.file_paths
+                result = export_table_to_parquet_parallel(
+                    source_connection,
+                    mapping_rows,
+                    args.export_dir,
+                    run_id,
+                    connection_factory=connect_to_4d,
+                    fetch_size=args.fetch_size,
+                    worker_count=args.workers,
+                )
+                logger.info(
+                    "4D Parquet extraction completed: table=%s rows=%s "
+                    "workers=%s fetch_size=%s query_seconds=%.3f "
+                    "fetch_seconds=%.3f serialization_seconds=%.3f "
+                    "parquet_write_seconds=%.3f total_seconds=%.3f file=%s",
+                    result.target_table,
+                    result.row_count,
+                    result.worker_count,
+                    result.fetch_size,
+                    result.query_seconds,
+                    result.fetch_seconds,
+                    result.serialization_seconds,
+                    result.parquet_write_seconds,
+                    result.total_seconds,
+                    result.file_path,
+                )
+                output_paths = (result.file_path,)
                 audit.finish_step(
                     table_step,
                     "SUCCESS",
                     json.dumps(
                         {
                             "export_run_id": result.run_id,
-                            "format": args.output_format,
+                            "format": "parquet",
                             "rows": result.row_count,
                             "files": [str(path) for path in output_paths],
                             "workers": result.worker_count,
@@ -432,18 +396,14 @@ def main(argv: list[str] | None = None) -> int:
                             "query_seconds": result.query_seconds,
                             "fetch_seconds": result.fetch_seconds,
                             "serialization_seconds": result.serialization_seconds,
-                            "file_write_seconds": (
-                                result.parquet_write_seconds
-                                if args.output_format == "parquet"
-                                else result.csv_write_seconds
-                            ),
+                            "file_write_seconds": result.parquet_write_seconds,
                             "total_seconds": result.total_seconds,
                         },
                         sort_keys=True,
                     ),
                 )
                 print(
-                    f"Extraction completed: format={args.output_format} "
+                    f"Extraction completed: format=parquet "
                     f"table={result.target_table} rows={result.row_count} "
                     f"workers={result.worker_count} "
                     f"fetch_size={result.fetch_size} files={len(output_paths)}"

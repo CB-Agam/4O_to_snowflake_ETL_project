@@ -13,7 +13,7 @@ from uuid import uuid4
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from etl.csv_export import (
+from etl.parquet_parallel_helpers import (
     _integer_key,
     _primary_key_source_column,
     _query_key_ranges,
