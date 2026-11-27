@@ -23,6 +23,8 @@ from etl.audit import SnowflakeAuditLogger
 from etl.parallel_parquet_export import export_table_to_parquet_parallel
 from etl.parquet_export import _safe_path_component
 from etl.source_extract import SourceRowCountUnavailable
+from etl.table_status import TableStatusStore
+from scripts.upload_parquet_exports import main as upload_parquet_exports
 
 DEFAULT_EXPORT_DIR = PROJECT_ROOT / "exports"
 logger = logging.getLogger(__name__)
@@ -56,20 +58,23 @@ TABLES_TO_SKIP = {
     "Proposals",
     "Risk EB Employee Action Log","Risk EB Employees","Risk Extensions","SBX_Documents","SBX_Files","SBX_Pending Deletions","SBX_Photos","SBX_Schedules","Surveys",
     "System_Actions","Web Payment Request Log","Web_Proposal_Questions","zSubtable_Do_Not_Use","Background Images",
-    "Access Privileges","Acc_Cheque_Payments","Account Accumulations","Account Contacts","Accounts","Accounts Aging Item","Accounts Aging Table","ACH Transactions","ACH Transmission Log","Adjustment","Agent Commissions","Alerts","Allocations","Audit Trail","Bank Accounts Table","Branch MasterFile",
+    "Access Privileges","Acc_Cheque_Payments","Account Accumulations","Accounts","Accounts Aging Item","Accounts Aging Table","ACH Transactions","ACH Transmission Log","Adjustment","Agent Commissions","Alerts","Allocations","Audit Trail","Bank Accounts Table","Branch MasterFile",
     "Certificates","Claims","Claims Batches","Claims Checklist","Claims Limits and Extensions","Claims OS Recovery","Claims Partc Intm Pmts","Claims Partc Reserve Pmnts","Claims Partc Reserves","Claims Partc Revision History","Claims Participants","Claims RI Split","Claims Service Actions","Claims Trans","Claims Trans Rcpt Items","Claims Trans RI","Construction Class Table","Construction Type Table","Construction Value Table","Converted Data Instructions","Core_Actions","Core_Actions_Rank Table","Country Masterfile",
     "Data Toolbox","Delivery Table","Documents",
 }
 
 # Global tracking for signal handler
 _current_audit = None
+_current_status_store = None
+_current_batch_id = None
 _last_table_step = None
 _last_table_name = None
 
 
 def _handle_signal(signum, frame):
     """Handle Ctrl+C or other signals to update audit before exit"""
-    global _current_audit, _last_table_step, _last_table_name
+    global _current_audit, _current_status_store, _current_batch_id
+    global _last_table_step, _last_table_name
     if _current_audit and _last_table_step is not None:
         try:
             sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
@@ -81,6 +86,18 @@ def _handle_signal(signum, frame):
             logger.info("Updated last table record on signal %s", sig_name)
         except Exception as e:
             logger.exception("Could not update audit on signal: %s", e)
+    if _current_status_store and _current_batch_id and _last_table_name:
+        try:
+            _current_status_store.mark_extraction_failed(
+                _current_batch_id,
+                _normalize_name(_last_table_name),
+                "Extraction interrupted by signal",
+            )
+        except Exception:
+            logger.exception(
+                "Could not mark interrupted table %s as FAILED",
+                _last_table_name,
+            )
     sys.exit(1)
 
 
@@ -162,22 +179,12 @@ def _source_mapping(connection, table_name: str, target_table: str) -> list[dict
     return rows
 
 
-def _has_parquet_export(export_dir: Path, target_table: str) -> Path | None:
-    table_dir = export_dir / _normalize_name(target_table)
-    if not table_dir.is_dir():
-        return None
-    return next(
-        (path for path in table_dir.rglob("*.parquet") if path.is_file()),
-        None,
-    )
-
-
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Extract all columns of 4D tables to final local Parquet files and "
-            "record extraction status in "
-            "Snowflake ETL_PIPELINE_LOG. No extracted data is uploaded."
+            "track table status in Snowflake before uploading the completed batch "
+            "using the same Snowflake connection."
         )
     )
     parser.add_argument(
@@ -207,6 +214,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Local export root (default: repository exports directory)",
     )
     parser.add_argument(
+        "--archive-dir",
+        type=Path,
+        default=PROJECT_ROOT / "uploaded_exports",
+        help="Upload archive root (default: repository uploaded_exports directory)",
+    )
+    parser.add_argument(
         "--run-id",
         default=None,
         help="Optional run ID; a UUID is generated when omitted",
@@ -227,6 +240,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Disable file logging, only log to Snowflake audit table",
     )
+    parser.add_argument(
+        "--no-auto-upload",
+        action="store_true",
+        help="Leave extracted Parquet files READY without starting the uploader",
+    )
     return parser.parse_args(argv)
 
 
@@ -235,8 +253,13 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(disable_file_logging=args.no_file_logging)
     source_connection = None
     snowflake_connection = None
+    status_store = None
     exit_code = 0
-    global _current_audit
+    processed_count = 0
+    last_table_step = None
+    last_table_name = None
+    batch_id = None
+    global _current_audit, _current_status_store, _current_batch_id
     try:
         if not args.database.strip() or not args.schema.strip():
             raise ValueError(
@@ -254,7 +277,16 @@ def main(argv: list[str] | None = None) -> int:
             signal.signal(signal.SIGTERM, _handle_signal)
         except (AttributeError, ValueError):
             pass  # SIGTERM not available on all platforms
-        run_id = args.run_id or audit.run_id
+        run_id = _safe_path_component(args.run_id or audit.run_id, "Batch ID")
+        if len(run_id) > 255:
+            raise ValueError("Batch ID must not exceed 255 characters")
+        batch_id = run_id
+        status_store = TableStatusStore(
+            snowflake_connection, args.database, args.schema
+        )
+        status_store.ensure_table()
+        _current_status_store = status_store
+        _current_batch_id = batch_id
         step_name = "PARQUET_EXTRACTION"
         all_tables = _normalize_name(args.table) == "ALL"
         try:
@@ -288,9 +320,18 @@ def main(argv: list[str] | None = None) -> int:
             audit.record(step_name, "FAILED", args.table, message)
             raise ValueError(message)
 
+        status_store.register_batch(
+            batch_id,
+            [
+                _normalize_name(name)
+                for name in table_names
+                if name not in TABLES_TO_SKIP
+            ],
+        )
         selected_tables = []
         print("table_names>>>>>>>>>>>",table_names)
         for table_name in table_names:
+            target_table = _normalize_name(table_name)
             try:
                 # Skip tables in the skip list
                 if table_name in TABLES_TO_SKIP:
@@ -300,7 +341,6 @@ def main(argv: list[str] | None = None) -> int:
                     _record_skip(audit, step_name, table_name, message)
                     continue
                 
-                target_table = _normalize_name(table_name)
                 if _safe_path_component(target_table, "Target table") != target_table:
                     raise ValueError(
                         f"4D table name cannot be used safely as an export target: "
@@ -308,20 +348,6 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if len(target_table) > 255:
                     raise ValueError(f"Target table name is too long: {target_table!r}")
-                if all_tables:
-                    existing_file = _has_parquet_export(
-                        args.export_dir,
-                        target_table,
-                    )
-                    if existing_file is not None:
-                        message = (
-                            f"Skipping {table_name}: Parquet already exists at "
-                            f"{existing_file}"
-                        )
-                        logger.info(message)
-                        print(message)
-                        _record_skip(audit, step_name, target_table, message)
-                        continue
                 mapping_rows = _source_mapping(source_connection, table_name, target_table)
                 selected_tables.append((table_name, target_table, mapping_rows))
             except AuditLoggingError:
@@ -329,6 +355,10 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 logger.exception("Could not prepare extraction for %s", table_name)
                 print(f"Extraction failed for {table_name}: {exc}")
+                if table_name not in TABLES_TO_SKIP:
+                    status_store.mark_extraction_failed(
+                        batch_id, target_table, str(exc)
+                    )
                 audit.record(
                     step_name, "FAILED", table_name, str(exc),
                     error_message=traceback.format_exc(),
@@ -338,14 +368,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Prepared {len(selected_tables)} tables for extraction")
         logger.info("Prepared %d tables for extraction", len(selected_tables))
 
-        processed_count = 0
-        last_table_step = None
-        last_table_name = None
         for table_name, target_table, mapping_rows in selected_tables:
             global _last_table_step, _last_table_name
             processed_count += 1
             print(f"[{processed_count}/{len(selected_tables)}] Processing table: {table_name}")
             logger.info("Processing table %d/%d: %s", processed_count, len(selected_tables), table_name)
+            table_step = None
+            if not status_store.begin_extraction(batch_id, target_table):
+                current = status_store.get_row(batch_id, target_table)
+                message = (
+                    f"Skipping {table_name}: batch status is already {current.status}"
+                )
+                logger.info(message)
+                _record_skip(audit, step_name, target_table, message)
+                continue
             table_step = audit.record(
                 step_name, "RUNNING", target_table,
                 json.dumps({"export_run_id": run_id, "format": "parquet"}),
@@ -382,6 +418,15 @@ def main(argv: list[str] | None = None) -> int:
                     result.file_path,
                 )
                 output_paths = (result.file_path,)
+                relative_path = result.file_path.resolve().relative_to(
+                    args.export_dir.resolve()
+                )
+                status_store.mark_ready(
+                    batch_id,
+                    target_table,
+                    relative_path,
+                    result.row_count,
+                )
                 audit.finish_step(
                     table_step,
                     "SUCCESS",
@@ -417,11 +462,25 @@ def main(argv: list[str] | None = None) -> int:
                     "message": str(exc),
                 }
                 logger.warning("Skipping %s: %s; row count unknown", table_name, exc)
+                status_store.mark_extraction_failed(
+                    batch_id, target_table, str(exc)
+                )
                 audit.finish_step(table_step, "SKIPPED", json.dumps(details, sort_keys=True))
                 print(f"Skipping {table_name}: {exc}; row count unknown")
             except Exception as exc:
                 logger.exception("4D extraction failed for %s", table_name)
                 print(f"Extraction failed for {table_name}: {exc}")
+                try:
+                    status_store.mark_extraction_failed(
+                        batch_id, target_table, str(exc)
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not mark extraction failed for %s in batch %s",
+                        target_table,
+                        batch_id,
+                    )
+                    exit_code = 1
                 audit.finish_step(
                     table_step, "FAILED", f"Extraction failed: {exc}",
                     error_message=traceback.format_exc(),
@@ -475,6 +534,41 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info("Recorded successful completion to audit table")
             except Exception as audit_exc:
                 logger.exception("Could not record completion to audit table: %s", audit_exc)
+
+        print(f"Batch ID: {batch_id}")
+        _last_table_step = None
+        _last_table_name = None
+        if not args.no_auto_upload:
+            if status_store.eligible_rows(batch_id):
+                upload_args = [
+                    "--batch-id",
+                    batch_id,
+                    "--export-dir",
+                    str(args.export_dir),
+                    "--archive-dir",
+                    str(args.archive_dir),
+                    "--database",
+                    args.database,
+                    "--schema",
+                    args.schema,
+                ]
+                logger.info("Starting Snowflake upload for batch %s", batch_id)
+                upload_result = upload_parquet_exports(
+                    upload_args, connection=snowflake_connection
+                )
+                if upload_result:
+                    logger.error(
+                        "Upload failed for batch %s with exit code %s",
+                        batch_id,
+                        upload_result,
+                    )
+                    exit_code = 1
+            else:
+                logger.info(
+                    "No READY or upload-failed tables in batch %s; skipping uploader",
+                    batch_id,
+                )
+                print("No tables are READY for upload; skipping Snowflake upload.")
     except Exception as outer_exc:
         logger.exception("OUTER EXCEPTION - Extraction or audit logging failed for %s: %s", args.table, outer_exc)
         print(f"ERROR: Extraction stopped unexpectedly: {outer_exc}")

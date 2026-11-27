@@ -4,6 +4,7 @@ import argparse
 import logging
 import shutil
 import sys
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,18 +24,22 @@ from connections.snowflake_connection import (
 from etl.incremental import acquire_table_run_lock, release_table_run_lock
 from etl.load import _local_file_uri
 from etl.parquet_snowflake import _qualified_name, _quote_identifier, _safe_stage_component
+from etl.table_status import TableStatusStore
 
 logger = logging.getLogger(__name__)
 
 
-def _parquet_info(path: Path) -> tuple[str, list[str], int]:
+def _parquet_info(path: Path) -> tuple[str, str, list[str], int]:
     parquet = pq.ParquetFile(path)
     try:
         schema = parquet.schema_arrow
         metadata = schema.metadata or {}
         target = metadata.get(b"target_table", b"").decode("utf-8").strip()
+        batch_id = metadata.get(b"run_id", b"").decode("utf-8").strip()
         if not target:
             raise ValueError(f"Parquet file has no target_table metadata: {path}")
+        if not batch_id:
+            raise ValueError(f"Parquet file has no run_id metadata: {path}")
         if _safe_stage_component(target, "Target table") != target:
             raise ValueError(f"Unsupported target table name in {path}: {target!r}")
         if len(target) > 255:
@@ -55,7 +60,7 @@ def _parquet_info(path: Path) -> tuple[str, list[str], int]:
             raise ValueError(
                 f"Parquet columns must contain text for VARCHAR upload: {unsupported}"
             )
-        return target, columns, parquet.metadata.num_rows
+        return batch_id, target, columns, parquet.metadata.num_rows
     finally:
         parquet.close()
 
@@ -176,19 +181,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--export-dir", type=Path, default=PROJECT_ROOT / "exports")
     parser.add_argument("--archive-dir", type=Path, default=PROJECT_ROOT / "uploaded_exports")
+    parser.add_argument(
+        "--batch-id",
+        help="Batch run ID; inferred only when exactly one batch is eligible",
+    )
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=2,
+        help="Additional upload attempts for failed tables (default: 2)",
+    )
     parser.add_argument("--database", default=settings.snowflake_database)
     parser.add_argument("--schema", default=settings.snowflake_schema)
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    configure_logging()
+def main(argv: list[str] | None = None, *, connection=None) -> int:
+    owns_connection = connection is None
+    if owns_connection:
+        configure_logging()
     args = _parse_args(argv)
-    connection = None
     exit_code = 0
     try:
         export_dir = args.export_dir.resolve()
         archive_dir = args.archive_dir.resolve()
+        if args.retry_attempts < 0:
+            raise ValueError("--retry-attempts cannot be negative")
         if not export_dir.is_dir():
             raise FileNotFoundError(f"Export directory not found: {export_dir}")
         if archive_dir == export_dir or export_dir in archive_dir.parents:
@@ -196,45 +214,172 @@ def main(argv: list[str] | None = None) -> int:
         if not args.database.strip() or not args.schema.strip():
             raise ValueError("Snowflake database and schema are required")
 
-        paths = sorted(
-            (path for path in export_dir.rglob("*.parquet") if path.is_file()),
-            key=lambda path: (path.stat().st_mtime_ns, str(path)),
-        )
-        if not paths:
-            print(f"No Parquet files found in {export_dir}")
-            return 0
-
-        selected = []
-        for path in paths:
-            target, columns, row_count = _parquet_info(path)
-            destination = archive_dir / path.relative_to(export_dir)
-            if destination.exists():
-                raise FileExistsError(f"Archive file already exists: {destination}")
-            selected.append((path, target, columns, row_count, destination))
-
-        connection = connect_to_snowflake()
-        blocked_tables: set[str] = set()
-        for path, target, columns, row_count, destination in selected:
-            try:
-                target_key = target.casefold()
-                if target_key in blocked_tables:
-                    raise RuntimeError(
-                        f"An earlier file for {target} failed; preserving snapshot order"
-                    )
-                loaded = _upload_file(
-                    connection, args.database, args.schema, path, target, columns, row_count
+        if owns_connection:
+            connection = connect_to_snowflake()
+        status_store = TableStatusStore(connection, args.database, args.schema)
+        status_store.ensure_table()
+        eligible_batches = status_store.eligible_batches()
+        batch_id = args.batch_id
+        if batch_id is None:
+            if not eligible_batches:
+                print("No READY or upload-failed table statuses are available")
+                return 0
+            if len(eligible_batches) > 1:
+                raise ValueError(
+                    "Multiple eligible batches exist; specify one with --batch-id: "
+                    + ", ".join(eligible_batches)
                 )
-                _archive_file(path, destination)
-                print(f"Uploaded {path} to {target}: {loaded} rows; moved to {destination}")
-            except Exception:
-                blocked_tables.add(target.casefold())
-                logger.exception("Upload or archive failed for %s", path)
+            batch_id = eligible_batches[0]
+
+        selected = status_store.eligible_rows(batch_id)
+        if not selected:
+            print(f"No eligible tables found for batch {batch_id}")
+            return 0
+        print(f"Uploading batch {batch_id}: {len(selected)} eligible table(s)")
+
+        for row in selected:
+            if not status_store.begin_upload(batch_id, row.table_name):
+                logger.info(
+                    "Skipping %s in batch %s; it is no longer eligible",
+                    row.table_name,
+                    batch_id,
+                )
+                continue
+
+            try:
+                if not row.parquet_path:
+                    raise ValueError(
+                        f"Status row has no Parquet path for {row.table_name}"
+                    )
+                relative_path = Path(row.parquet_path)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    raise ValueError(
+                        f"Unsafe Parquet path in status row for {row.table_name}: "
+                        f"{row.parquet_path!r}"
+                    )
+                path = (export_dir / relative_path).resolve()
+                if path == export_dir or export_dir not in path.parents:
+                    raise ValueError(
+                        f"Parquet path resolves outside export directory: {path}"
+                    )
+                if not path.is_file():
+                    raise FileNotFoundError(f"Parquet file not found: {path}")
+                file_batch, target, columns, row_count = _parquet_info(path)
+                if file_batch != batch_id:
+                    raise ValueError(
+                        f"Parquet batch ID mismatch for {path.name}: "
+                        f"expected {batch_id!r}, found {file_batch!r}"
+                    )
+                if target.casefold() != row.table_name.casefold():
+                    raise ValueError(
+                        f"Parquet target mismatch for {path.name}: "
+                        f"expected {row.table_name!r}, found {target!r}"
+                    )
+                if row.expected_rows is None or row_count != row.expected_rows:
+                    raise ValueError(
+                        f"Parquet row count mismatch for {row.table_name}: "
+                        f"status={row.expected_rows}, file={row_count}"
+                    )
+                destination = archive_dir / relative_path
+                if destination.exists():
+                    raise FileExistsError(f"Archive file already exists: {destination}")
+            except Exception as exc:
+                status_store.mark_upload_failed(batch_id, row.table_name, str(exc))
+                logger.exception(
+                    "Parquet pre-upload validation failed for %s in batch %s",
+                    row.table_name,
+                    batch_id,
+                )
                 exit_code = 1
+                continue
+
+            uploaded = False
+            for attempt in range(args.retry_attempts + 1):
+                if attempt:
+                    if not status_store.begin_upload(batch_id, row.table_name):
+                        logger.error(
+                            "Could not restart upload for %s in batch %s",
+                            row.table_name,
+                            batch_id,
+                        )
+                        exit_code = 1
+                        break
+                try:
+                    loaded = _upload_file(
+                        connection,
+                        args.database,
+                        args.schema,
+                        path,
+                        target,
+                        columns,
+                        row_count,
+                    )
+                except Exception as exc:
+                    status_store.mark_upload_failed(
+                        batch_id, row.table_name, str(exc)
+                    )
+                    logger.exception(
+                        "Upload attempt %d failed for %s in batch %s",
+                        attempt + 1,
+                        row.table_name,
+                        batch_id,
+                    )
+                    if attempt < args.retry_attempts:
+                        time.sleep(min(2 ** attempt, 8))
+                        continue
+                    exit_code = 1
+                    break
+
+                try:
+                    status_store.mark_uploaded(batch_id, row.table_name, loaded)
+                except Exception as exc:
+                    logger.exception(
+                        "Snowflake load succeeded but UPLOADED status failed for %s "
+                        "in batch %s",
+                        row.table_name,
+                        batch_id,
+                    )
+                    try:
+                        status_store.mark_upload_failed(
+                            batch_id,
+                            row.table_name,
+                            f"Snowflake load succeeded but status update failed: {exc}",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not record upload-status failure for %s in batch %s",
+                            row.table_name,
+                            batch_id,
+                        )
+                    exit_code = 1
+                    break
+                try:
+                    _archive_file(path, destination)
+                    status_store.record_archive(
+                        batch_id, row.table_name, destination.relative_to(archive_dir)
+                    )
+                except Exception:
+                    logger.exception(
+                        "Upload succeeded but archive failed for %s in batch %s",
+                        row.table_name,
+                        batch_id,
+                    )
+                    exit_code = 1
+                else:
+                    print(
+                        f"Uploaded {path} to {target}: {loaded} rows; "
+                        f"moved to {destination}"
+                    )
+                uploaded = True
+                break
+
+            if not uploaded:
+                continue
     except Exception:
         logger.exception("Parquet upload failed")
         exit_code = 1
     finally:
-        if connection is not None:
+        if owns_connection and connection is not None:
             try:
                 close_snowflake_connection(connection)
             except Exception:
